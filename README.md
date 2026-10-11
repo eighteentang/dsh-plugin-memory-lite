@@ -30,15 +30,34 @@ DSH 的会话本身是有记忆边界的：换一个会话、或者一次压缩�
 
 ## 安装
 
+命令行：
+
 ```
 dsh plugin --profile <你的profile名> add github:eighteentang/dsh-plugin-memory-lite#v1.3.0
 ```
+
+或者**在界面里装**（不用命令行）：侧边栏 **「插件」→「添加插件」**，把地址贴进去。
+那个输入框接受包名、**Git 地址**、压缩包、本地绝对路径四类写法：
+
+| 贴什么 | 结果 |
+|---|---|
+| `https://github.com/eighteentang/dsh-plugin-memory-lite#v1.3.0` | ✅ 装指定版本（**推荐**） |
+| `https://github.com/eighteentang/dsh-plugin-memory-lite` | ✅ 跟随主分支 |
+| `github:eighteentang/dsh-plugin-memory-lite#v1.3.0` | ✅ 同上两种写法都行 |
+
+> ⚠ **别贴 Releases 页的地址。** `…/releases/tag/v1.3.0` 会被**直接拒绝**
+> （提示 `a URL must point at a git repository or a tarball`）—— 它只认**仓库根地址**
+> 或压缩包链接；版本要写成 `#v1.3.0` 拼在根地址后面。同理 `…/tree/main` 这类网页地址也不行。
+>
+> 这几条不是猜的：宿主侧的解析函数 `parseInstallSpec` 被抽出来逐例跑过，
+> 见 `tools/diag/diag-check-install-spec.mjs`。
 
 装完后**重启客户端**，设置页会出现 **「记忆控制」**。
 
 > **`#v1.3.0` 是版本钉子** —— 钉住版本避免"装到一半上游改了"。
 > 去掉 `#…` 就是跟随主分支（自动拿到新改动，也自动拿到新 bug）。
-> 全部版本见 [CHANGELOG.md](CHANGELOG.md)；升级就是把版本号换掉重新执行一次。
+> 全部版本见 [CHANGELOG.md](CHANGELOG.md)；升级就是**先卸载再装新版**
+> （DSH 的插件目前不支持自动更新）。
 
 > 开发期用 `link:` 装（`link:D:/path/to/memory-lite`）也是支持的，
 > 但**必须保留 `peerDependencies`**，否则插件的包解析会失败。
