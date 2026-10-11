@@ -1,0 +1,18 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 64 64" width="64" height="64" role="img" aria-label="Memory Lite">
+  <defs>
+    <linearGradient id="ml-tile" x1="0" y1="0" x2="1" y2="1">
+      <stop offset="0" stop-color="#4f7cff"/>
+      <stop offset="1" stop-color="#7a5cf0"/>
+    </linearGradient>
+  </defs>
+  <!-- 底：圆角方块（在浅色/深色底上都 readable） -->
+  <rect x="3" y="3" width="58" height="58" rx="15" fill="url(#ml-tile)"/>
+  <!-- 三层记忆：自下而上分别是「日志层 / 条目层 / 注入层」 -->
+  <g fill="none" stroke="#ffffff" stroke-linecap="round" stroke-width="4.2">
+    <path d="M17 42h30" opacity="0.55"/>
+    <path d="M17 32h30" opacity="0.8"/>
+    <path d="M17 22h18"/>
+  </g>
+  <!-- 右上角的「命中」点：被召回的那一条 -->
+  <circle cx="44.5" cy="22" r="4.6" fill="#ffffff"/>
+</svg>

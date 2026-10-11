@@ -1,0 +1,6 @@
+{
+  "meta": {
+    "title": "Memory Lite",
+    "description": "Local-first memory for DSH: auto-captures every turn, distills while idle, injects on demand. Everything stays in a local SQLite file."
+  }
+}

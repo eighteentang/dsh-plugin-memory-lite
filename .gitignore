@@ -1,0 +1,23 @@
+# 依赖与构建产物
+node_modules/
+dist/
+build/
+
+# 日志与临时文件
+*.log
+*.tmp
+.tmp-*
+
+# 误操作留下的备份（见 AGENTS.md：别用 PowerShell 改源码）
+*.corrupt-bak
+*.bak
+*.orig
+*~
+
+# 运行时数据（记忆库不该进版本库）
+.dsh-memory/
+.dsh-meow/
+
+# 系统杂物
+.DS_Store
+Thumbs.db

@@ -1,0 +1,10 @@
+# 探针 bundle 的 loader patch
+#
+# 这个文件的存在本身就是一次声明：package.json 里 `dsh.bundle.patch` 指向它，
+# profile 把本 bundle 列入 dsh.profile.bundles 时，下面的 insert 才会被应用。
+#
+# ⚠ 只声明 id 与 name，不带 config：探针的开关走 apply(ctx, config) 的默认值，
+#   避免在还没验证 manifest 格式之前就引入 Config schema 这个额外变量。
+- insert:
+    - id: memory-lite-probe
+      name: 'dsh-plugin-memory-lite'
