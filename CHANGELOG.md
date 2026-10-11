@@ -8,8 +8,55 @@
 **怎么钉版本**（避免"装到一半上游改了"）：
 
 ```sh
-dsh plugin --profile <你的profile名> add github:eighteentang/dsh-plugin-memory-lite#v1.1.0
+dsh plugin --profile <你的profile名> add github:eighteentang/dsh-plugin-memory-lite#v1.2.0
 ```
+
+---
+
+## [1.2.0] - 2026-10-11
+
+这一版的三项都不是"想到什么做什么"，而是**先量了真库**再定（量法与数字见 `AGENTS.md`
+的「V3 实测依据」一节）。量的时候把库**拷一份到临时目录**再跑 —— `search()` 会写
+`hit_count`，直接在真库上量会把面板的「用过 N 次」灌水。
+
+### 修复
+
+- **蒸馏看到的其实是同一段系统样板**
+  日志一条 = 一整轮，里面夹着宿主以 `<system-reminder>` 注入的用户全局 `AGENTS.md`。
+  而蒸馏原本只取**前 1500 字** —— 实测 10 条真实日志里**有 7 条的"前 1500 字"逐字相同**，
+  最大的 4 条（7~10 万字）只能看到 **1.4%~2%**。也就是说：模型拿到的不是"这一轮发生了什么"，
+  而是同一段样板，蒸馏出来的条目自然只能反映那段样板。
+  现在 `pickLogExcerpt()` **先剔样板再截断**：整块剔除 `<system-reminder>` / `<environment_context>`
+  （含未闭合的）、逐行剔运行时样板（`Runtime context.` / `Elapsed since …` / `Browser time zone …`），
+  再把重心放到**尾部**（头 40% + 中略标记 + 尾 60% —— 结论在尾部，提问在头部）。
+  总字符：649,870 → 450,701（降到 69.4%）。
+
+### 新增
+
+- **召回观测（`recall_runs` 表）**：**每一轮**召回尝试都落一行，**包括 0 命中的那种**。
+  以前回答不了"召回到底命中多少轮" —— 日志层存的是一整轮文本，拿不到"当时那句 query"，
+  于是离线既复现不了、也验收不了任何检索改动。现在配 `tools/diag/diag-recall-quality.mjs`
+  可以在库副本上**逐条重放**，给出零命中率与和历史记录的差异。
+  query 落库前过 `redactSecrets()` 并截到 500 字；只保留最近 500 行（观测数据不该让库膨胀）。
+
+### 变更
+
+- **常驻索引段每条只列 20 字**（原为 48 字）。实测依据：33 条真实记忆时索引段已占
+  3431/4096 B（83.8%），**每行 123 B**（30/33 条没有标题，回落到"正文前 48 字"，
+  中文 1 字 = 3 B）→ 只装得下约 33 条，再多就会**静默**从 system prompt 里消失。
+  截到 20 字后每行约 83 B，约能装 49 条（+48%）。
+  ⚠ **不要用"给旧条目回填标题"来解决这件事** —— 回填的标题同样会被截断，额外容量是 0；
+  要调容量就调 `INDEX_TITLE_CHARS`。
+
+### 开发期修掉的两个"校验器假绿"
+
+- **假 ctx 覆盖了同名事件的多个处理函数**：`verify-v1` 原本用 `Map<事件, 函数>` 存处理函数，
+  而 `apply()` 对 `agent/pre-step` 注册了**两个**（召回、压缩后补回），后一个把前一个覆盖 ——
+  于是"pre-step 只追加不改写"实际测的是**补回**分支，**每轮都在跑的召回分支从未被检验过**。
+  现在改成数组并按真实瀑布语义串起来跑，召回路径的断言才真正生效。
+- **校验器污染真实注册表**：`apply()` 会往 `$DSH_HOME/memory-lite/workspaces.json` 登记工作区库，
+  而校验器用的是临时目录 —— 每跑一次就留下一条指向已删除路径的记录。现在校验器先把
+  `DSH_HOME` 指向临时目录再加载 `index.js`。
 
 ---
 
@@ -84,3 +131,4 @@ dsh plugin --profile <你的profile名> add github:eighteentang/dsh-plugin-memor
 ---
 
 [1.1.0]: https://github.com/eighteentang/dsh-plugin-memory-lite/releases/tag/v1.1.0
+[1.2.0]: https://github.com/eighteentang/dsh-plugin-memory-lite/releases/tag/v1.2.0

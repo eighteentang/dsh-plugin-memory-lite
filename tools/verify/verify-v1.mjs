@@ -21,8 +21,9 @@ import { createInjectState, createInjectedMessage, isOwnInjection, stripOwnInjec
 import { buildTools, DESTRUCTIVE_TOOLS } from '../../lib/tools.js';
 import { captureTurn, extractTurnText } from '../../lib/capture.js';
 import { openMemory } from '../../lib/storage.js';
-import { resolveConfig, toJsonSchema } from '../../lib/config.js';
-import { runDistill, buildUserPrompt } from '../../lib/distill.js';
+import { resolveConfig, toJsonSchema, INDEX_MAX_BYTES, INDEX_TITLE_CHARS } from '../../lib/config.js';
+import { runDistill, buildUserPrompt, cleanLogText, pickLogExcerpt, DISTILL_MAX_CHARS_PER_LOG } from '../../lib/distill.js';
+import { DatabaseSync } from 'node:sqlite';
 
 const results = [];
 const ok = (n, d = '') => results.push({ pass: true, n, d });
@@ -346,7 +347,59 @@ console.log('=== verify-v1 ===\n');
   rmSync(root, { recursive: true, force: true });
 }
 
+// ── D3. 蒸馏输入清洗（V3-1）──────────────────────────────────────────────
+// 真机病根（2026-10-11 实测）：日志一条 = 一整轮，里面夹着宿主注入的
+// <system-reminder>（AGENTS.md 样板等）。原本只取前 1500 字 → 10 条日志里
+// **7 条的"前 1500 字"逐字相同**，模型拿到的是同一段样板而不是这一轮发生了什么。
+{
+  const mixed = [
+    '<system-reminder>',
+    '（用户全局 AGENTS.md 那一大段样板）',
+    '</system-reminder>',
+    'Runtime context.',
+    'Current DSH file policy: danger-full-access',
+    '',
+    '用户说：把那个坑记下来',
+    'Elapsed since the preceding step context: 3m',
+    'Browser time zone for this request: Asia/Shanghai',
+  ].join('\n');
+  const cleaned = cleanLogText(mixed);
+  !cleaned.includes('system-reminder') ? ok('清洗：剔掉 <system-reminder> 整块') : bad('清洗：剔掉 <system-reminder> 整块', cleaned.slice(0, 80));
+  cleaned.includes('用户说：把那个坑记下来') ? ok('清洗：保留真实内容') : bad('清洗：保留真实内容', cleaned);
+  !/Runtime context\.|Elapsed since|Browser time zone|file policy/.test(cleaned)
+    ? ok('清洗：剔掉运行时样板行')
+    : bad('清洗：剔掉运行时样板行', cleaned.slice(0, 120));
+
+  const unclosed = cleanLogText('正文A\n<system-reminder>\n这段永远闭合不了\n');
+  unclosed === '正文A' ? ok('清洗：未闭合的 <system-reminder> 也剔掉') : bad('清洗：未闭合的块', JSON.stringify(unclosed));
+
+  // 病根回归：样板相同、只有结尾不同的两条，清洗后**必须不再相同**
+  const boiler = '<system-reminder>\n（同一段样板）\n</system-reminder>\n';
+  const a = cleanLogText(`${boiler}结尾甲：把 E49 记进经验库`);
+  const b = cleanLogText(`${boiler}结尾乙：把 E50 记进经验库`);
+  a !== b && a.includes('结尾甲') && b.includes('结尾乙')
+    ? ok('清洗：样板相同、结尾不同 → 结果不再相同（病根回归）')
+    : bad('清洗：样板相同、结尾不同', `${JSON.stringify(a)} vs ${JSON.stringify(b)}`);
+
+  const onlyNoise = cleanLogText('<system-reminder>\n整条都是样板\n</system-reminder>');
+  onlyNoise === '' ? ok('清洗：整条都是样板时返回空串') : bad('清洗：整条都是样板', JSON.stringify(onlyNoise));
+
+  const long = `${'甲'.repeat(3000)}中段标记${'乙'.repeat(3000)}尾部结论`;
+  const ex = pickLogExcerpt(long, 1500);
+  ex.startsWith('甲') && ex.endsWith('尾部结论') && ex.includes('中略')
+    ? ok('取样：头尾都留、中间有中略标记（结论在尾部，不能被切掉）', `${ex.length} 字`)
+    : bad('取样：头尾都留', `${ex.slice(0, 30)}…${ex.slice(-30)}`);
+  ex.length <= 1500 ? ok('取样：含中略标记后仍不超预算', `${ex.length} ≤ 1500`) : bad('取样：超预算', String(ex.length));
+  pickLogExcerpt('很短的一条', 1500) === '很短的一条' ? ok('取样：未超长时原样返回') : bad('取样：未超长时原样返回');
+  DISTILL_MAX_CHARS_PER_LOG === 1500 ? ok('取样：默认上限已导出', String(DISTILL_MAX_CHARS_PER_LOG)) : bad('取样：默认上限');
+}
+
 // ── E. 接线（假 ctx 跑 apply）────────────────────────────────────────────
+// ⚠ 2026-10-11 修：原来 `handlers` 是 Map<事件, 单个处理函数> —— 而 apply 对
+//   `agent/pre-step` 注册了**两个**处理函数（召回、压缩后补回），后一个把前一个**覆盖**了。
+//   于是"pre-step 只追加不改写"这条断言实际上一直在测**补回**那个分支，**召回从未被测到**
+//   （而召回才是每轮都跑的那条）。同一形状的假绿在本项目出现过多次（E13/E42）。
+//   现在改成 Map<事件, 处理函数数组>，并**按瀑布语义串起来跑**。
 {
   const root = mkdtempSync(join(tmpdir(), 'memwire-'));
   const registered = [];
@@ -370,7 +423,9 @@ console.log('=== verify-v1 ===\n');
       },
     },
     on(event, handler) {
-      handlers.set(event, handler);
+      const list = handlers.get(event) ?? [];
+      list.push(handler);
+      handlers.set(event, list);
       return () => disposed.push(`on:${event}`);
     },
     get: () => undefined,
@@ -380,6 +435,14 @@ console.log('=== verify-v1 ===\n');
       return cleanup;
     },
   };
+
+  // ⚠ 隔离 DSH_HOME：apply() 会打开面板回退库、并往注册表
+  //   `$DSH_HOME/memory-lite/workspaces.json` 里登记工作区库。不隔离的话，
+  //   每跑一次校验器就往**真实注册表**里塞一条指向临时目录的记录
+  //   （实测污染过：留下 `Temp\memwire-XXXX\.dsh-memory-test` 这种已删除的路径）。
+  //   index.js 在模块顶层读 DSH_HOME，所以必须在**动态 import 之前**设置。
+  const prevDshHome = process.env.DSH_HOME;
+  process.env.DSH_HOME = join(root, '.dsh-home');
 
   const mod = await import(pathToFileURL(join(process.cwd(), 'index.js')).href + `?t=${Date.now()}`);
   typeof mod.apply === 'function' ? ok('index.js 导出 apply') : bad('index.js 导出 apply');
@@ -395,25 +458,103 @@ console.log('=== verify-v1 ===\n');
   typeof section?.text === 'function' ? ok('索引段文本按 assembly 求值（可按工作区变化）') : bad('索引段文本按 assembly 求值');
 
   for (const evt of ['tools/pre-execute', 'agent/turn-stopping', 'agent/pre-step', 'session/event']) {
-    handlers.has(evt) ? ok(`接线：注册了 ${evt}`) : bad(`接线：注册了 ${evt}`);
+    (handlers.get(evt)?.length ?? 0) > 0
+      ? ok(`接线：注册了 ${evt}`, `${handlers.get(evt).length} 个处理函数`)
+      : bad(`接线：注册了 ${evt}`);
   }
 
-  // pre-step 行为：只追加、不改写既有消息
-  const preStep = handlers.get('agent/pre-step');
-  if (typeof preStep === 'function') {
+  // 先往工作区库里放一条与 query 相关的记忆 —— 否则召回路径必然 0 命中，测不到"真的注入"
+  {
+    const seeded = openMemory({ dir: join(root, '.dsh-memory-test'), workspace: root });
+    seeded.put({
+      level: 'fact',
+      content: '记忆插件采用两层架构：日志层只落盘、长期条目层才注入',
+      keywords: ['记忆插件', '两层架构', '注入'],
+      importance: 3,
+    });
+    seeded.close();
+  }
+
+  // 按真实瀑布语义串起同一事件的多个处理函数：handler(payload, next)
+  const runPreStep = (payload, base) => {
+    const list = handlers.get('agent/pre-step') ?? [];
+    const step = (i, d) => {
+      const h = list[i];
+      if (typeof h !== 'function') return Promise.resolve(d);
+      return h(payload, () => step(i + 1, d));
+    };
+    return step(0, base);
+  };
+
+  const preStepCall = () => {
     const claimed = [{ role: 'user', content: [{ type: 'text', text: '问一个关于记忆插件架构的问题' }], source: { kind: 'user' } }];
     const baseDecision = { kind: 'enter', messages: [...claimed] };
+    const payload = { agent: { session: { id: 'w1', header: { cwd: root } } }, messages: claimed, step: 1, turn: 7 };
+    return { claimed, baseDecision, payload };
+  };
+
+  if ((handlers.get('agent/pre-step') ?? []).length >= 2) {
+    ok('接线：召回与压缩后补回登记为两个独立处理函数（不再互相覆盖）', `${handlers.get('agent/pre-step').length} 个`);
+  } else {
+    bad('接线：pre-step 应有两个处理函数', `实际 ${(handlers.get('agent/pre-step') ?? []).length} 个`);
+  }
+
+  {
+    const { claimed, baseDecision, payload } = preStepCall();
     const before = JSON.stringify(baseDecision.messages);
-    const out = await preStep({ agent: { session: { id: 'w1', header: { cwd: root } } }, messages: claimed, step: 1 }, async () => baseDecision);
+    const out = await runPreStep(payload, baseDecision);
     JSON.stringify(baseDecision.messages) === before ? ok('pre-step 不修改传入的 decision（无副作用）') : bad('pre-step 不修改传入的 decision');
     out?.kind === 'enter' && Array.isArray(out.messages) && out.messages.length >= claimed.length
       ? ok('pre-step 返回合法 enter 决策', `消息数 ${out.messages.length}`)
       : bad('pre-step 返回合法 enter 决策', JSON.stringify(out)?.slice(0, 200));
     out.messages[0] === claimed[0] ? ok('pre-step 保留原有消息在前（只追加）') : bad('pre-step 保留原有消息在前');
+
+    // 这次库里**有**匹配的条目，所以召回必须真的追加一条注入消息
+    const injected = out.messages.filter((m) => m?.source?.kind === SOURCE_KIND);
+    injected.length >= 1
+      ? ok('召回：命中时追加一条注入消息', `注入 ${injected.length} 条`)
+      : bad('召回：命中时追加一条注入消息', `消息数 ${out.messages.length}`);
+    String(injected[0]?.content?.[0]?.text ?? '').includes('记忆插件')
+      ? ok('召回：注入内容来自命中的记忆')
+      : bad('召回：注入内容来自命中的记忆', JSON.stringify(injected[0]?.content)?.slice(0, 120));
+  }
+
+  // V3-3 召回观测：**0 命中也必须落一行** —— 那正是"换个说法就搜不到"的直接证据
+  try {
+    const conn = new DatabaseSync(join(root, '.dsh-memory-test', 'memory.db'), { readOnly: true });
+    const rows = conn.prepare('SELECT query_text, segments, hits, picked FROM recall_runs ORDER BY id DESC').all();
+    conn.close();
+    rows.length >= 1
+      ? ok('召回观测：落下了这一轮的 query 与命中数', `hits=${rows[0].hits} picked=${rows[0].picked} segments=${rows[0].segments}`)
+      : bad('召回观测：落一行', `rows=${rows.length}`);
+    String(rows[0]?.query_text ?? '').includes('记忆插件架构')
+      ? ok('召回观测：记下了当时那句 query（离线可重放）')
+      : bad('召回观测：query 内容', String(rows[0]?.query_text ?? '').slice(0, 60));
+    (rows[0]?.hits ?? 0) >= 1 ? ok('召回观测：命中数被如实记录') : bad('召回观测：命中数', String(rows[0]?.hits));
+  } catch (e) {
+    bad('召回观测：落一行', String(e?.message ?? e));
+  }
+
+  // 0 命中也要落一行（同一条路径、换一句搜不到的 query；库里被标记为"已注入"后仍会记录）
+  {
+    const { baseDecision, payload } = preStepCall();
+    const noHit = { ...payload, messages: [{ role: 'user', content: [{ type: 'text', text: 'zzz完全无关的查询词qqq' }], source: { kind: 'user' } }] };
+    noHit.agent = { session: { id: 'w2', header: { cwd: root } } };
+    const base2 = { kind: 'enter', messages: [...noHit.messages] };
+    await runPreStep(noHit, base2);
+    void baseDecision;
+    try {
+      const conn = new DatabaseSync(join(root, '.dsh-memory-test', 'memory.db'), { readOnly: true });
+      const zero = conn.prepare('SELECT COUNT(*) AS n FROM recall_runs WHERE session_id = ? AND hits = 0').get('w2').n;
+      conn.close();
+      zero >= 1 ? ok('召回观测：0 命中的那一轮同样落了一行', `hits=0 的行 ${zero} 条`) : bad('召回观测：0 命中也落一行', `rows=${zero}`);
+    } catch (e) {
+      bad('召回观测：0 命中也落一行', String(e?.message ?? e));
+    }
   }
 
   // pre-execute 审批闸门
-  const gate = handlers.get('tools/pre-execute');
+  const gate = (handlers.get('tools/pre-execute') ?? [])[0];
   if (typeof gate === 'function') {
     const allow = await gate({ name: 'memory_search' }, async () => ({ kind: 'allow' }));
     allow?.kind === 'allow' ? ok('审批闸门：非破坏性工具放行') : bad('审批闸门：非破坏性工具放行', JSON.stringify(allow));
@@ -431,6 +572,33 @@ console.log('=== verify-v1 ===\n');
     : bad('注册/释放成对', `注册 ${registeredCount} → 释放 ${disposed.length}`);
 
   rmSync(root, { recursive: true, force: true });
+  if (prevDshHome === undefined) delete process.env.DSH_HOME;
+  else process.env.DSH_HOME = prevDshHome;
+}
+
+// ── F. 索引段容量（V3-2）─────────────────────────────────────────────────
+// 实测：33 条真实记忆时索引段已占 3431/4096 B，**每行 123 B**（30/33 条没标题，
+// 回落到"正文前 48 字"，中文 1 字 = 3 B）→ 只装得下约 33 条。截到 20 字后每行约
+// 83 B，装得下约 49 条。这里把这个结论钉成断言，防止以后有人把截断长度改回去。
+{
+  const mk = (i, title, content) => ({ id: `e${i}`, level: 'fact', title, content, status: 'active', updatedAt: i, project: '全局' });
+  const many = Array.from({ length: 30 }, (_, i) => mk(i, null, `第 ${i} 条记忆的正文内容，用来测索引段容量。`.repeat(3)));
+  const text = renderIndexSection({ entries: many });
+  const lines = text.split('\n').slice(1).filter((l) => !l.startsWith('-（另有'));
+  const bodies = lines.map((l) => l.replace(/^- \[[^\]]*\] /, ''));
+  const longest = Math.max(...bodies.map((b) => b.length));
+  longest <= INDEX_TITLE_CHARS
+    ? ok('索引段：每行都截到 INDEX_TITLE_CHARS 字内', `最长 ${longest} 字 / 上限 ${INDEX_TITLE_CHARS}`)
+    : bad('索引段：有行未被截断', `最长 ${longest} 字 > ${INDEX_TITLE_CHARS}`);
+  const bytes = Buffer.byteLength(text, 'utf8');
+  lines.length === 30 && bytes <= INDEX_MAX_BYTES
+    ? ok('索引段：30 条全列出且不超字节预算', `${bytes} B / ${INDEX_MAX_BYTES} B`)
+    : bad('索引段：30 条容量', `列出 ${lines.length} 行 · ${bytes} B`);
+
+  const titled = renderIndexSection({ entries: [mk(1, '短标题', '正文很长'.repeat(60))] });
+  titled.includes('短标题') && !titled.includes('正文很长')
+    ? ok('索引段：有条目标题时优先用标题，不回落正文')
+    : bad('索引段：标题优先', titled.replace(/\n/g, ' | ').slice(0, 80));
 }
 
 // ── 输出 ─────────────────────────────────────────────────────────────────

@@ -15,7 +15,7 @@ import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 
 import { openMemory } from '../../lib/storage.js';
-import { resolveConfig } from '../../lib/config.js';
+import { resolveConfig, redactSecrets } from '../../lib/config.js';
 import { buildTools, brief } from '../../lib/tools.js';
 import { shouldAutoDistill, runDistill, resolveDistillTargets } from '../../lib/distill.js';
 
@@ -278,6 +278,41 @@ try {
     mem.close();
     rmSync(root3, { recursive: true, force: true });
   }
+  // ── V3-3 召回观测：存储层 ─────────────────────────────────────────────
+  {
+    A.recordRecallRun({ sessionId: 's1', turn: 1, query: '记忆插件 两层架构', segments: 3, hits: 2, picked: 1, keep: 3 });
+    const first = A.recentRecallRuns(10);
+    first.length === 1 && first[0].query.includes('两层架构') && first[0].hits === 2 && first[0].picked === 1
+      ? ok('召回观测：记一行并读回来（含 hits/picked）', `query=${first[0].query.slice(0, 20)}`)
+      : bad('召回观测：记一行并读回来', JSON.stringify(first[0] ?? null));
+    first[0]?.turn === 1 && first[0]?.segments === 3 ? ok('召回观测：turn 与 segments 也存下来') : bad('召回观测：turn/segments', JSON.stringify(first[0] ?? null));
+
+    // 0 命中同样要落行（这条不是"顺便加的"，它是这个功能存在的理由）
+    A.recordRecallRun({ sessionId: 's1', turn: 2, query: 'zzz搜不到的东西', segments: 5, hits: 0, picked: 0, keep: 3 });
+    const zero = A.recentRecallRuns(10).filter((r) => r.hits === 0);
+    zero.length === 1 ? ok('召回观测：0 命中也落行') : bad('召回观测：0 命中也落行', `zero=${zero.length}`);
+
+    // 超长 query 截断到 500 字（否则一行就能把库撑大）
+    const longQuery = '很长的查询'.repeat(300);
+    A.recordRecallRun({ sessionId: 's1', turn: 3, query: longQuery, segments: 9, hits: 0, picked: 0, keep: 3 });
+    const capped = A.recentRecallRuns(10)[0];
+    capped.query.length === 500 && capped.queryChars === 500
+      ? ok('召回观测：超长 query 截断到 500 字', `${capped.query.length} 字`)
+      : bad('召回观测：超长 query 截断', `${capped.query.length} 字`);
+
+    // 只保留最近 keep 行
+    for (let i = 0; i < 6; i++) A.recordRecallRun({ sessionId: 's1', turn: 100 + i, query: `第 ${i} 条`, keep: 3 });
+    const kept = A.recentRecallRuns(100);
+    kept.length === 3 ? ok('召回观测：按 keep 裁剪（只留最近 3 行）', `剩 ${kept.length} 行`) : bad('召回观测：按 keep 裁剪', `剩 ${kept.length} 行`);
+    kept[0]?.turn === 105 ? ok('召回观测：裁剪保留的是最新的', `最新 turn=${kept[0]?.turn}`) : bad('召回观测：裁剪保留最新的', `最新 turn=${kept[0]?.turn}`);
+
+    // 脱敏由调用方（index.js）负责 —— 这里钉住那条契约本身
+    const redacted = redactSecrets('key=ghp_AAAABBBBCCCCDDDDEEEEFFFFGGGGHHHHIIII');
+    !redacted.includes('ghp_AAAA') && redacted.includes('REDACTED')
+      ? ok('召回观测：query 落库前会过 redactSecrets（契约）', redacted.slice(0, 40))
+      : bad('召回观测：redactSecrets 契约', redacted);
+  }
+
 } finally {
   A.close();
   B.close();

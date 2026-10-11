@@ -16,8 +16,8 @@ import { homedir } from 'node:os';
 import { dirname, join } from 'node:path';
 import { existsSync, mkdirSync, readdirSync, readFileSync, writeFileSync } from 'node:fs';
 
-import { Config as MemoryConfig, resolveConfig } from './lib/config.js';
-import { openMemory, memoryDirFor } from './lib/storage.js';
+import { Config as MemoryConfig, resolveConfig, redactSecrets, RECALL_RUN_KEEP } from './lib/config.js';
+import { openMemory, memoryDirFor, querySegments } from './lib/storage.js';
 import { renderIndexSection, renderRecallBlock, renderRecoveryBlock } from './lib/prompt.js';
 import { createInjectState, createInjectedMessage, isOwnInjection, lastUserText, stripOwnInjections, pickForInjection } from './lib/inject.js';
 import { captureTurn, extractTurnText } from './lib/capture.js';
@@ -375,6 +375,21 @@ export const apply = (ctx, rawConfig = {}) => {
             seen: injectState.seen(sessionId),
             maxItems: config.injectMaxItems,
           });
+          // V3 召回观测：**每一轮都记**，包括"搜到了但都被注入过"和"0 命中"这两种。
+          // 0 命中是最需要的样本 —— 它正是"换个说法就搜不到"的直接证据。
+          try {
+            memory.recordRecallRun({
+              sessionId,
+              turn: payload?.turn ?? null,
+              query: redactSecrets(query),
+              segments: querySegments(query).length,
+              hits: candidates.length,
+              picked: picked.length,
+              keep: RECALL_RUN_KEEP,
+            });
+          } catch (error) {
+            trace(ctx?.logger, 'record-recall-FAILED', { message: String(error?.message ?? error).slice(0, 160) });
+          }
           if (!picked.length) return decision;
 
           const text = renderRecallBlock(picked, { maxChars: config.injectMaxChars });
