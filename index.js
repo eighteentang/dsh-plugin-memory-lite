@@ -700,8 +700,14 @@ export const apply = (ctx, rawConfig = {}) => {
               } catch (error) {
                 return { ok: false, error: `listProviders 失败：${String(error?.message ?? error).slice(0, 200)}` };
               }
+              if (!Array.isArray(providers)) providers = [];
+              // ⚠ listProviders() 返回的是**对象数组**（路由名在 `.id`），不是字符串数组。
+              //   这里同时给出扁平名字与原始对象：前者给人看，后者证明形状。
+              const providerIds = providers
+                .map((p) => (typeof p === 'string' ? p : typeof p?.id === 'string' ? p.id : null))
+                .filter(Boolean);
               const models = {};
-              for (const p of Array.isArray(providers) ? providers : []) {
+              for (const p of providerIds) {
                 try {
                   const list = typeof llm.listModels === 'function' ? await llm.listModels(p) : [];
                   models[p] = (Array.isArray(list) ? list : []).slice(0, 8).map((m) => ({ id: m?.id, name: m?.name }));
@@ -710,7 +716,7 @@ export const apply = (ctx, rawConfig = {}) => {
                 }
               }
               const resolvedTargets = await resolveDistillTargets({ llm, config });
-              return { ok: true, providers, models, resolvedTargets };
+              return { ok: true, providers, providerIds, models, resolvedTargets };
             }),
           }),
           server.register({

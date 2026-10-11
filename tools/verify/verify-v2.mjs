@@ -236,6 +236,45 @@ try {
       ? ok('显式配置的 distillProvider/distillModel 优先')
       : bad('显式配置优先', JSON.stringify(explicit));
 
+    // ⑥ **真实契约**：`listProviders()` 返回**对象数组**（路由名在 `.id`），不是字符串数组。
+    //    来源：`dsh-llm/lib/index.js:1899`
+    //      `[...this.adapters.values()].map(({ provider }) => ({ ...provider }))`
+    //    我按 README 那句"报告已注册路由"猜成字符串数组，又用
+    //    `.filter(p => typeof p === 'string')` 把真实路由**全过滤掉**了 →
+    //    真机表现："没有可用的模型提供方"。这条断言就是钉住这个形状的。
+    const objectShaped = await resolveDistillTargets({
+      llm: { listProviders: () => [{ id: 'route-a', name: 'A' }, { id: 'route-b' }], listModels: async (p) => [{ id: `${p}-model` }] },
+      config: resolveConfig({}),
+    });
+    objectShaped.length === 2 && objectShaped[0]?.provider === 'route-a' && objectShaped[0]?.model === 'route-a-model'
+      ? ok('listProviders() 返回**对象数组**时能解析出路由（真实契约）', objectShaped.map((t) => t.provider).join(','))
+      : bad('对象数组形态的 listProviders 能解析', JSON.stringify(objectShaped));
+
+    const stringShaped = await resolveDistillTargets({
+      llm: { listProviders: () => ['plain-a'], listModels: async (p) => [{ id: `${p}-model` }] },
+      config: resolveConfig({}),
+    });
+    stringShaped[0]?.provider === 'plain-a' ? ok('字符串数组形态也兼容（防御）') : bad('字符串数组形态也兼容', JSON.stringify(stringShaped));
+
+    // ⑦ 端到端：对象形态 + 第一个路由 NO_ADAPTER → 换第二个并成功
+    mem.appendLog({ sessionId: 'sp', turn: 4, text: `对象形态提供方用例。${'q'.repeat(220)}` });
+    const tried3 = [];
+    const objectFlaky = {
+      listProviders: () => [{ id: 'obj-dead' }, { id: 'obj-good' }],
+      listModels: async (p) => [{ id: `${p}-m` }],
+      stream(options) {
+        tried3.push(options.provider);
+        if (options.provider === 'obj-dead') {
+          return gen([{ type: 'finish', reason: { kind: 'error', failure: { code: 'NO_ADAPTER', message: 'x' } } }]);
+        }
+        return gen(okChunks());
+      },
+    };
+    const r3 = await runDistill({ memory: mem, config: cfgD, llm: objectFlaky, force: true });
+    r3?.ok === true && r3.via === 'obj-good/obj-good-m'
+      ? ok('端到端：对象形态 + 第一个不可用 → 换下一个成功', `试过 ${tried3.join(' → ')}`)
+      : bad('端到端：对象形态换路', JSON.stringify({ r3, tried3 }));
+
     mem.close();
     rmSync(root3, { recursive: true, force: true });
   }

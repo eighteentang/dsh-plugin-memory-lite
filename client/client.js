@@ -166,14 +166,20 @@ window.__ModuleLoader__.load({
             // 默认展示"条目最多的那个库"——迁移过来的数据通常在它里面
             const best = stores.reduce((acc, s, i) => ((s.entries?.length ?? 0) > ((stores[acc]?.entries?.length) ?? -1) ? i : acc), 0);
             return {
+              // ⚠ 必须 `...prev`：这个方法在"立即整理 / 改状态"之后被调用，
+              //   而那两个动作**先** setState 了 error/notice。第一版这里直接返回新对象、
+              //   把 error/notice 重置成 undefined → 提示**只闪一下就消失**
+              //   （真机现象："界面闪了一下，没反应"）。这两个字段属于"动作的结果"，不该被刷新清掉。
+              ...prev,
               loading: false,
-              error: data?.ok === false ? String(data.error ?? '未知错误') : null,
+              // 快照自身的读取错误单独一个字段，避免把动作的错误冲掉
+              snapshotError: data?.ok === false ? String(data.error ?? '未知错误') : null,
               stores,
               active: prev.stores.length === stores.length ? Math.min(prev.active, Math.max(stores.length - 1, 0)) : best,
             };
           });
         } catch (error) {
-          setState((s) => ({ ...s, loading: false, error: `${String(error?.message ?? error)}（宿主路由 ${API}/snapshot 不可达）` }));
+          setState((s) => ({ ...s, loading: false, snapshotError: `${String(error?.message ?? error)}（宿主路由 ${API}/snapshot 不可达）` }));
         }
       }, []);
 
@@ -192,6 +198,7 @@ window.__ModuleLoader__.load({
 
       const doSetStatus = async (id, status) => {
         setBusy(id + status);
+        setState((s) => ({ ...s, error: null, notice: null }));
         try {
           await api('/set-status', { id, status, dir: currentDir });
           await reload();
@@ -204,6 +211,8 @@ window.__ModuleLoader__.load({
 
       const doDistill = async () => {
         setBusy('distill');
+        // 先清掉上一次的结果，否则新点了还显示旧提示（用户会以为"没反应"）
+        setState((s) => ({ ...s, error: null, notice: null }));
         try {
           const out = await api('/distill', { dir: currentDir });
           const reason = out?.result?.reason;
@@ -309,10 +318,12 @@ window.__ModuleLoader__.load({
         // 状态说明：把「三个状态到底啥区别」写在界面上，别让用户猜
         h('div', { key: 'legend', style: { ...css.stat, opacity: 0.65 } },
           '状态说明：在用 = 有效且可能被召回；已完成 = 这件事做完了（内容仍有效）；已停用 = 不再被注入，但仍可搜到、可随时恢复'),
-        state.error
-          ? h('div', { key: 'err', style: { ...css.stat, color: 'var(--dsw-alias-text-error, #d33)' } }, `出错了：${state.error}`)
+        // 显示优先级：动作的错误 > 快照读取的错误；任一存在就不显示提示语
+        (state.error ?? state.snapshotError)
+          ? h('div', { key: 'err', style: { ...css.stat, color: 'var(--dsw-alias-text-error, #d33)' } },
+              `${state.error ? '出错了：' : '读取出错：'}${state.error ?? state.snapshotError}`)
           : null,
-        !state.error && state.notice
+        !(state.error ?? state.snapshotError) && state.notice
           ? h('div', { key: 'notice', style: { ...css.stat, color: 'var(--dsw-alias-text-secondary, inherit)' } }, state.notice)
           : null,
         state.loading
