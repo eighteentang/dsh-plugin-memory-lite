@@ -207,7 +207,84 @@ if (loaded) {
       bad('注册了槽位条目');
     }
 
-    // ④ 试渲染组件（用假 createElement，递归跑一遍函数组件）
+    // ── 列表布局不变量（2026-10-12 加）───────────────────────────────────
+    // 起因：用户报「设置页的 list 有点难看，有些标签占了 2 行」。
+    // 根因是 flex 行里长文本挤别人换行（45 条里 40 条没标题 → 回落正文前 24 字，长度不可控），
+    // 而标签自己没有 nowrap。**这类回归只能靠断言挡住** —— 样式本身只能人眼看，
+    // 但"会不会换行"是由几个具体属性决定的，那几个属性机器能验。
+    {
+      const T = mod.__test;
+      if (!T || typeof T.renderRow !== 'function') {
+        bad('列表行渲染可离线断言', '__test.renderRow 不存在');
+      } else {
+        ok('列表行渲染可离线断言', `__test 暴露了 renderRow/LIST_COLS/ROW_HEIGHT/css`);
+
+        // 用**极端数据**渲染：没有标题（回落长文本）+ 超长项目名 + 敏感 + 各种计数
+        const longContent = '很长的正文回落文本'.repeat(12);
+        const cases = [
+          ['无标题+超长项目', { id: 'a', level: 'lesson', project: 'meow-memory-and-more', title: '', content: longContent, status: 'active', sensitive: 0, injectCount: 0 }],
+          ['有标题+无项目', { id: 'b', level: 'project', project: null, title: '短标题', content: 'x', status: 'stale', sensitive: 1, injectCount: 7 }],
+          ['计数为 0', { id: 'c', level: 'fact', project: '全局', title: '', content: 'y', status: 'archived', sensitive: 0, injectCount: 0 }],
+        ];
+        // ⚠ 假 React 的 createElement 把 children 存成 **rest 数组** ——
+        //   `h('div', p, [6 个格子])` → children = [[6 个格子]]。
+        //   第一版我直接读 children[2]，取到的是那个数组本身 → 五条断言全假红。
+        const cellsOf = (row) => (row?.children ?? []).flat(Infinity).filter((c) => c && c.__el);
+        const rows = cases.map(([name, e], i) => [name, T.renderRow(e, i, { onStatus: () => {}, disabled: false })]);
+        const styles = rows.map(([, r]) => r?.props?.style ?? {});
+
+        styles.every((s) => s.display === 'grid') ? ok('每行都是 grid（列宽由整表统一决定，行不会互相挤）') : bad('每行都是 grid', JSON.stringify(styles.map((s) => s.display)));
+        styles.every((s) => s.gridTemplateColumns === T.LIST_COLS) ? ok('每行用同一个列模板', T.LIST_COLS) : bad('每行用同一个列模板', JSON.stringify(styles.map((s) => s.gridTemplateColumns)));
+        styles.every((s) => s.height === T.ROW_HEIGHT && Number.isFinite(s.height)) ? ok('每行高度固定（不许被内容撑高）', `height=${T.ROW_HEIGHT}`) : bad('每行高度固定', JSON.stringify(styles.map((s) => s.height)));
+        styles.every((s) => s.boxSizing === 'border-box') ? ok('行是 border-box（padding+border 不撑高）') : bad('行是 border-box');
+        styles.every((s) => s.overflow === 'hidden' || s.overflowX === 'hidden') ? ok('行裁剪溢出（越界内容不会换行）') : bad('行裁剪溢出');
+
+        // 每一行的格子数必须一致 —— 少一个格子，后面所有列都会错位
+        const cellCounts = rows.map(([, r]) => cellsOf(r).length);
+        new Set(cellCounts).size === 1 ? ok('每行格子数一致（列不会错位）', `${cellCounts[0]} 格`) : bad('每行格子数一致', JSON.stringify(cellCounts));
+        rows.every(([, r]) => cellsOf(r).every((c) => c.__el === true)) ? ok('没有 null 格子（用空 span 占位而不是省略）') : bad('有 null 格子（会错位）');
+
+        // 标题列：省略号要生效必须同时满足 minWidth:0 + overflow:hidden
+        const titleCell = cellsOf(rows[0][1])[2];
+        const ts = titleCell?.props?.style ?? {};
+        ts.minWidth === 0 && ts.overflow === 'hidden' && ts.textOverflow === 'ellipsis' && ts.whiteSpace === 'nowrap'
+          ? ok('标题列：minWidth:0 + 省略号 + 不换行（长标题不会撑破行）')
+          : bad('标题列省略号四件套', JSON.stringify(ts));
+
+        // 无标题时回落到正文，且**必须仍然只占一个格子**（不能多插一行文字）
+        const fallbackText = String(titleCell?.children ?? '');
+        fallbackText.length <= 26 && !fallbackText.includes('\n')
+          ? ok('无标题时回落到正文前 24 字以内且不含换行', `${fallbackText.length} 字`)
+          : bad('无标题回落', `len=${fallbackText.length}`);
+
+        // 标签：必须 nowrap（否则药丸里的文字自己断成两行 —— 用户看到的正是这个）
+        T.css?.tag?.whiteSpace === 'nowrap'
+          ? ok('标签样式含 whiteSpace:nowrap（药丸不会自我断行）')
+          : bad('标签样式 whiteSpace', String(T.css?.tag?.whiteSpace));
+        T.css?.tag?.flex === '0 0 auto'
+          ? ok('标签不参与伸缩（宽度不会被标题挤扁）')
+          : bad('标签 flex', String(T.css?.tag?.flex));
+
+        // 项目列的省略号：超长项目名必须截断而不是换行
+        const projStyle = cellsOf(rows[0][1])[1]?.props?.style ?? {};
+        projStyle.maxWidth && projStyle.overflow === 'hidden' && projStyle.textOverflow === 'ellipsis'
+          ? ok('项目列：超长项目名截断（不换行）', `maxWidth=${projStyle.maxWidth}`)
+          : bad('项目列截断', JSON.stringify(projStyle));
+
+        // 敏感列：没有敏感内容时也要渲染成一个空格子（占位，保持列对齐）
+        cellsOf(rows[0][1])[3]?.__el === true && cellsOf(rows[2][1])[3]?.__el === true
+          ? ok('敏感列始终占位（没有敏感内容也渲染空 span）')
+          : bad('敏感列占位');
+
+        // 状态下拉：三态齐全
+        const opts = (cellsOf(rows[0][1])[5]?.children ?? []).flat(Infinity).map((o) => o?.props?.value);
+        JSON.stringify(opts) === JSON.stringify(['active', 'stale', 'archived'])
+          ? ok('状态下拉三态齐全', opts.join('/'))
+          : bad('状态下拉三态', JSON.stringify(opts));
+      }
+    }
+
+
     const component = calls.register[0]?.component;
     if (typeof component === 'function') {
       try {

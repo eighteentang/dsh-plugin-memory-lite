@@ -106,17 +106,35 @@ window.__ModuleLoader__.load({
       body: { fontSize: 13, whiteSpace: 'pre-wrap', wordBreak: 'break-word' },
       tag: {
         fontSize: 11,
+        lineHeight: '16px',
         padding: '1px 6px',
         borderRadius: 999,
         border: '1px solid var(--dsw-alias-border-secondary, rgba(128,128,128,.35))',
         opacity: 0.9,
+        // ⚠ 这两条是"标签占两行"的解药：不换行 + 不参与伸缩（宽度由列/内容决定）
+        whiteSpace: 'nowrap',
+        flex: '0 0 auto',
       },
       stat: { fontSize: 12, opacity: 0.8 },
     };
 
-    function Tag({ children, warn }) {
+    /**
+     * 列表的列模板（每行共用一张表 → 列宽统一、行高一致）。
+     * 层级 52 · 项目 84 · 标题 自适应（minmax(0,1fr) 是省略号能生效的前提）· 敏感 30 · 用过 40 · 状态 88
+     * ⚠ 改这里只要保证**总宽不超过面板**；列多了要相应收窄，不然标题就没地方了。
+     */
+    const LIST_COLS = '52px 84px minmax(0, 1fr) 30px 40px 88px';
+    /** 行高固定（像素）：所有行等高，长文本不许把行撑高 */
+    const ROW_HEIGHT = 32;
+
+    function Tag({ children, warn, style, title }) {
       return h('span', {
-        style: warn ? { ...css.tag, color: 'var(--dsw-alias-text-warning, #c98a00)' } : css.tag,
+        title,
+        style: {
+          ...css.tag,
+          ...(warn ? { color: 'var(--dsw-alias-text-warning, #c98a00)' } : null),
+          ...(style ?? null),
+        },
       }, children);
     }
 
@@ -435,40 +453,76 @@ window.__ModuleLoader__.load({
         state.loading
           ? h('div', { key: 'load', style: css.stat }, '读取中…')
           : h('div', { key: 'list', style: css.list }, shown.length
-            // 一行一条：层级 · 标题 · 状态 · 用过几次 + 状态操作。
-            // 正文**不在前端展示**（用户 2026-10-12 的决定）：35 条摊开正文太冗余；
-            // 想看全文可以问我，或者直接开库文件。
-            ? shown.map((e) => h('div', {
-                key: e.id,
-                style: { ...css.card, flexDirection: 'row', alignItems: 'center', gap: 8, padding: '5px 10px' },
-              }, [
-                h(Tag, { key: 'l' }, LEVEL_LABEL[e.level] ?? e.level),
-                e.project ? h(Tag, { key: 'p' }, e.project) : null,
-                h('span', {
-                  key: 't',
-                  title: e.title ? String(e.title) : String(e.content ?? '').slice(0, 120),
-                  style: { fontSize: 13, flex: '1 1 auto', overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' },
-                }, e.title || String(e.content ?? '').replace(/\s+/g, ' ').slice(0, 24) || '(无标题)'),
-                e.sensitive ? h(Tag, { key: 'se', warn: true }, '敏感') : null,
-                h('span', {
-                  key: 'used',
-                  style: { ...css.stat, flex: '0 0 auto' },
-                  title: '这条记忆被自动注入进对话的次数',
-                }, e.injectCount ? `用过 ${e.injectCount} 次` : '未用过'),
-                h('select', {
-                  key: 'st',
-                  style: { ...css.input, flex: '0 0 auto', minWidth: 92, padding: '2px 6px', fontSize: 12 },
-                  value: e.status,
-                  disabled: busy !== '',
-                  title: '在用 = 有效且可能被召回；已完成 = 这件事做完了（内容仍有效）；已停用 = 不再被注入，但仍可搜到、可恢复',
-                  onChange: (ev) => doSetStatus(e.id, ev.target.value),
-                }, [
-                  h('option', { key: 'a', value: 'active' }, '在用'),
-                  h('option', { key: 's', value: 'stale' }, '已完成'),
-                  h('option', { key: 'x', value: 'archived' }, '已停用'),
-                ]),
-              ].filter(Boolean)))
+            // 一行一条。**用 grid 而不是 flex**（2026-10-12 改）：
+            //   flex 下"长文本挤别人换行"是必然的 —— 45 条里有 40 条没有标题，回落成
+            //   「正文前 24 字」长度不可控，于是 tag 被挤得自己断行，出现"有些标签占两行"。
+            //   grid 的列宽由整张表统一决定，每行严格等高、列与列对齐，长文本一律省略号。
+            //   正文**不在前端展示**（用户决定）：想看全文悬停，或问我。
+            ? shown.map((e, i) => renderRow(e, i, {
+                disabled: busy !== '',
+                onStatus: (status) => doSetStatus(e.id, status),
+              }))
             : h('div', { key: 'empty', style: css.stat }, '没有符合条件的记忆。')),
+      ]);
+    }
+
+    /**
+     * 一行 = 一条记忆。**抽成纯函数**的两个理由：
+     *   ① 布局不变量可以离线断言（渲染函数里 useState 拿不到列表数据，
+     *      所以这条渲染路径以前从未被校验器碰到过 —— 见 verify-client.mjs）；
+     *   ② 改样式时不用在几百行 JSX 里找。
+     */
+    function renderRow(e, index, { onStatus, disabled }) {
+      return h('div', {
+        key: e.id,
+        style: {
+          display: 'grid',
+          gridTemplateColumns: LIST_COLS,
+          alignItems: 'center',
+          columnGap: 8,
+          padding: '0 10px',
+          height: ROW_HEIGHT,
+          overflow: 'hidden',
+          border: '1px solid var(--dsw-alias-border-secondary, rgba(128,128,128,.28))',
+          borderRadius: 8,
+          boxSizing: 'border-box',
+          // 斑马纹：长列表里好扫行（比全白底好认）
+          background: index % 2 ? 'rgba(128,128,128,.05)' : 'transparent',
+        },
+      }, [
+        h(Tag, { key: 'l', style: { width: 52, textAlign: 'center', boxSizing: 'border-box' } },
+          LEVEL_LABEL[e.level] ?? e.level),
+        h(Tag, {
+          key: 'p',
+          title: e.project ? `项目：${e.project}` : '没有项目归属',
+          style: { maxWidth: 84, overflow: 'hidden', textOverflow: 'ellipsis' },
+        }, e.project || '—'),
+        h('span', {
+          key: 't',
+          title: e.title ? String(e.title) : String(e.content ?? '').slice(0, 120),
+          style: { fontSize: 13, minWidth: 0, overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' },
+        }, e.title || String(e.content ?? '').replace(/\s+/g, ' ').slice(0, 24) || '(无标题)'),
+        // 敏感单独一列（窄），不占标题的位置；没有就是空格子，列对齐不受影响
+        e.sensitive
+          ? h(Tag, { key: 'se', warn: true, title: '含敏感内容：永远不会被自动注入（脱敏后也不会）', style: { width: 30, textAlign: 'center', boxSizing: 'border-box' } }, '敏')
+          : h('span', { key: 'se' }),
+        h('span', {
+          key: 'used',
+          title: e.injectCount ? `被自动注入过 ${e.injectCount} 次` : '还没被自动注入过',
+          style: { ...css.stat, textAlign: 'right', whiteSpace: 'nowrap', opacity: e.injectCount ? 0.8 : 0.35 },
+        }, e.injectCount ? `${e.injectCount}×` : '–'),
+        h('select', {
+          key: 'st',
+          style: { ...css.input, width: '100%', minWidth: 0, padding: '2px 6px', fontSize: 12 },
+          value: e.status,
+          disabled,
+          title: '在用 = 有效且可能被召回；已完成 = 这件事做完了（内容仍有效）；已停用 = 不再被注入，但仍可搜到、可恢复',
+          onChange: (ev) => onStatus(ev.target.value),
+        }, [
+          h('option', { key: 'a', value: 'active' }, '在用'),
+          h('option', { key: 's', value: 'stale' }, '已完成'),
+          h('option', { key: 'x', value: 'archived' }, '已停用'),
+        ]),
       ]);
     }
 
@@ -504,6 +558,9 @@ window.__ModuleLoader__.load({
       });
     }
 
-    return { apply, name: 'dsh-plugin-memory-lite' };
+    // `__test` 是给离线校验器用的（verify-client.mjs 用它断言列表布局不变量：
+    // 每行等高、列模板一致、标签不换行、长文本省略号）。运行时没有任何代码读它，
+    // 多这一个字段比"每次改样式都靠人眼"划算。
+    return { apply, name: 'dsh-plugin-memory-lite', __test: { renderRow, LIST_COLS, ROW_HEIGHT, css } };
   },
 });
