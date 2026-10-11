@@ -1,4 +1,4 @@
-﻿# D:\DSH-dev\memory-lite —— 工作区约定
+# D:\DSH-dev\memory-lite —— 工作区约定
 
 > 这是**开发工作台**（`D:\DSH-dev`）下的项目，不是用户包。
 > 用户包只有 `D:\EasyDSH`。验证通过后的产品代码才复制过去。

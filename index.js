@@ -14,7 +14,7 @@
 import { createHash } from 'node:crypto';
 import { homedir } from 'node:os';
 import { dirname, join } from 'node:path';
-import { existsSync, mkdirSync, readdirSync, readFileSync, writeFileSync } from 'node:fs';
+import { appendFileSync, existsSync, mkdirSync, readdirSync, readFileSync, writeFileSync } from 'node:fs';
 
 import { Config as MemoryConfig, resolveConfig, redactSecrets, RECALL_RUN_KEEP } from './lib/config.js';
 import { openMemory, memoryDirFor, querySegments } from './lib/storage.js';
@@ -32,6 +32,30 @@ export { MemoryConfig as Config };
 const DSH_HOME = process.env.DSH_HOME || join(homedir(), '.dsh');
 /** 人设 / 工作规范存放目录 —— 内容就是那两个文本框的内容，插件自己的文件 */
 const PERSONA_DIR = join(DSH_HOME, 'memory-lite', 'persona');
+/** 加载日志落盘路径 */
+const STATUS_LOG = join(DSH_HOME, 'memory-lite-status.log');
+
+/**
+ * 加载期日志**必须写文件**。
+ *
+ * 依据（你们 AGENTS.md 里那条通用经验）：**Host 插件的 console.log 写到宿主进程 stdout，
+ * 桌面应用不落盘** —— 于是"插件加载失败"这种故障你什么都看不到，只能靠猜。
+ * 2026-10-12 就吃了这个亏：重启后 HTTP 路由全 404、设置页里「记忆控制」消失，
+ * 而离线校验 268 项全绿、插件在隔离环境里 apply 完全正常。
+ *
+ * 这个函数只依赖 node:fs/os/path，**在模块顶层就能用** —— 即使 apply 里崩了也写得下来。
+ */
+function fileLog(event, data) {
+  try {
+    appendFileSync(
+      STATUS_LOG,
+      `${new Date().toISOString()} ${event}${data === undefined ? '' : ' ' + JSON.stringify(data)}\n`,
+      'utf8',
+    );
+  } catch {
+    /* 日志失败不能连累插件 */
+  }
+}
 
 function trace(logger, event, data) {
   try {
@@ -39,6 +63,8 @@ function trace(logger, event, data) {
   } catch {
     /* 日志失败不能连累插件 */
   }
+  // 失败类事件额外落盘（正常事件不落，避免日志长得没人看）
+  if (String(event).includes('FAILED') || String(event).includes('invalid')) fileLog(event, data);
 }
 
 /** 注册失败只记录，不让整个 profile 挂掉 */
@@ -47,7 +73,7 @@ function guarded(logger, what, fn) {
     const disposer = fn();
     return typeof disposer === 'function' ? disposer : () => {};
   } catch (error) {
-    trace(logger, `${what}-FAILED`, { message: String(error?.message ?? error).slice(0, 300) });
+    trace(logger, `${what}-FAILED`, { message: String(error?.message ?? error).slice(0, 300), stack: String(error?.stack ?? '').split('\n').slice(0, 3).join(' | ') });
     return () => {};
   }
 }
@@ -61,6 +87,8 @@ function dirForWorkspace(workspaceRoot, dirName) {
 }
 
 export const apply = (ctx, rawConfig = {}) => {
+  // 第一件事就是落一条盘：只要它出现了，就证明「模块加载成功 + apply 进来了」
+  fileLog('apply-start', { dshHome: DSH_HOME, node: process.version });
   const config = (() => {
     try {
       return resolveConfig(rawConfig);
@@ -1021,6 +1049,12 @@ export const apply = (ctx, rawConfig = {}) => {
   });
 
   trace(ctx?.logger, 'ready', { dirName: config.dirName, autoCapture: config.autoCapture, autoRecall: config.autoRecall, autoDistill: config.autoDistill });
+  fileLog('apply-done', {
+    tools: 6,
+    sections: ['memory-lite:index', 'memory-lite:persona'],
+    routes: 6,
+    dirName: config.dirName,
+  });
 };
 
 export default { name, inject, Config: MemoryConfig, apply };
