@@ -16,7 +16,7 @@ import { join } from 'node:path';
 
 import { openMemory } from '../../lib/storage.js';
 import { resolveConfig, redactSecrets } from '../../lib/config.js';
-import { buildTools, brief } from '../../lib/tools.js';
+import { buildTools, brief, normalizeEntryInput } from '../../lib/tools.js';
 import { shouldAutoDistill, runDistill, resolveDistillTargets } from '../../lib/distill.js';
 
 const results = [];
@@ -311,6 +311,51 @@ try {
     !redacted.includes('ghp_AAAA') && redacted.includes('REDACTED')
       ? ok('召回观测：query 落库前会过 redactSecrets（契约）', redacted.slice(0, 40))
       : bad('召回观测：redactSecrets 契约', redacted);
+  }
+
+  // ── V3.1 面板写入：输入规整（工具与面板共用同一套）────────────────────
+  {
+    const bad1 = normalizeEntryInput({ content: '   ' });
+    bad1.error ? ok('输入规整：空内容被拒', bad1.error) : bad('输入规整：空内容被拒', JSON.stringify(bad1));
+
+    const lv = normalizeEntryInput({ content: 'x', level: '乱写' });
+    lv.value?.level === 'fact' ? ok('输入规整：非法层级退到 fact') : bad('输入规整：非法层级', JSON.stringify(lv));
+
+    const im = normalizeEntryInput({ content: 'x', importance: 99 });
+    const im2 = normalizeEntryInput({ content: 'x', importance: -3 });
+    const im3 = normalizeEntryInput({ content: 'x', importance: 'abc' });
+    im.value.importance === 4 && im2.value.importance === 1 && im3.value.importance === 1
+      ? ok('输入规整：重要性夹到 1~4，非数字退到 1', `99→${im.value.importance} · -3→${im2.value.importance} · abc→${im3.value.importance}`)
+      : bad('输入规整：重要性夹取', JSON.stringify([im.value.importance, im2.value.importance, im3.value.importance]));
+
+    const kw = normalizeEntryInput({ content: 'x', keywords: '记忆插件，两层架构、注入 检索' });
+    kw.value.keywords.length === 4 && kw.value.keywords[1] === '两层架构'
+      ? ok('输入规整：关键词接受逗号/顿号/空格分隔', kw.value.keywords.join('/'))
+      : bad('输入规整：关键词切分', JSON.stringify(kw.value.keywords));
+
+    const many = normalizeEntryInput({ content: 'x', keywords: Array.from({ length: 30 }, (_, i) => `k${i}`) });
+    many.value.keywords.length === 20 ? ok('输入规整：关键词最多 20 个') : bad('输入规整：关键词上限', String(many.value.keywords.length));
+
+    const proj = normalizeEntryInput({ content: 'x', level: 'project' });
+    proj.error ? ok('输入规整：project 缺项目名被拒', proj.error) : bad('输入规整：project 缺项目名', JSON.stringify(proj));
+    const proj2 = normalizeEntryInput({ content: 'x', level: 'project', project: 'EasyDSH', subcategory: '决策' });
+    proj2.value?.subcategory === null && proj2.value?.project === 'EasyDSH'
+      ? ok('输入规整：非法子类退到 null，项目名保留')
+      : bad('输入规整：project 子类', JSON.stringify(proj2));
+
+    const noTitle = normalizeEntryInput({ content: 'x' });
+    const emptyTitle = normalizeEntryInput({ content: 'x', title: '' });
+    noTitle.value.title === undefined && emptyTitle.value.title === ''
+      ? ok('输入规整：title 不传=不改动，传空串=清空（两种语义都要保留）')
+      : bad('输入规整：title 语义', JSON.stringify([noTitle.value.title, emptyTitle.value.title]));
+
+    const secret = normalizeEntryInput({ content: 'key=ghp_AAAABBBBCCCCDDDDEEEEFFFFGGGGHHHHIIII' });
+    !secret.value.content.includes('ghp_AAAA') && secret.value.content.includes('REDACTED')
+      ? ok('输入规整：内容落库前过 redactSecrets', secret.value.content.slice(0, 32))
+      : bad('输入规整：redactSecrets', secret.value.content);
+
+    const st = normalizeEntryInput({ content: 'x', status: '乱写' });
+    st.value.status === 'active' ? ok('输入规整：非法状态退到 active') : bad('输入规整：状态', st.value.status);
   }
 
 } finally {

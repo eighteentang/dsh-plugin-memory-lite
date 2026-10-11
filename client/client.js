@@ -157,6 +157,8 @@ window.__ModuleLoader__.load({
       const [query, setQuery] = React.useState('');
       const [statusFilter, setStatusFilter] = React.useState('active');
       const [busy, setBusy] = React.useState('');
+      // V3.1 面板写入：editor=null 表示没在编辑；否则是表单的当前值
+      const [editor, setEditor] = React.useState(null);
 
       const reload = React.useCallback(async () => {
         try {
@@ -202,6 +204,48 @@ window.__ModuleLoader__.load({
         try {
           await api('/set-status', { id, status, dir: currentDir });
           await reload();
+        } catch (error) {
+          setState((s) => ({ ...s, error: String(error?.message ?? error) }));
+        } finally {
+          setBusy('');
+        }
+      };
+
+      // ── V3.1 面板写入：新增 / 编辑 ────────────────────────────────────────
+      // 写进哪个库由**当前的库选择器**决定（多库时它就在上面），服务端也要求显式给 dir，
+      // 不猜"哪个工作区在活跃" —— 那个坑 V2 踩过（面板读到 global 回退空库，显示 0 条）。
+      const openCreate = () => setEditor({
+        id: null, level: 'fact', content: '', title: '', keywords: '', importance: 3, project: '', subcategory: '',
+      });
+
+      const openEdit = (e) => setEditor({
+        id: e.id,
+        level: e.level,
+        content: e.content ?? '',
+        title: e.title ?? '',
+        keywords: (e.keywords ?? []).join(' '),
+        importance: e.importance ?? 1,
+        project: e.project ?? '',
+        subcategory: e.subcategory ?? '',
+      });
+
+      const doSave = async () => {
+        if (!editor) return;
+        if (!String(editor.content ?? '').trim()) {
+          setState((s) => ({ ...s, error: '内容不能为空', notice: null }));
+          return;
+        }
+        setBusy('save');
+        setState((s) => ({ ...s, error: null, notice: null }));
+        try {
+          const out = await api('/save', { ...editor, dir: currentDir });
+          if (out?.ok === false) {
+            setState((s) => ({ ...s, error: String(out.error ?? '保存失败') }));
+          } else {
+            setEditor(null);
+            await reload();
+            setState((s) => ({ ...s, notice: out?.created ? '已新增一条。' : '已保存修改。' }));
+          }
         } catch (error) {
           setState((s) => ({ ...s, error: String(error?.message ?? error) }));
         } finally {
@@ -308,6 +352,13 @@ window.__ModuleLoader__.load({
           ]),
           h('button', { key: 'r', style: css.button, onClick: reload, disabled: state.loading || busy !== '' }, '刷新'),
           h('button', {
+            key: 'n',
+            style: css.button,
+            disabled: busy !== '' || !currentStore,
+            title: '手动新增一条记忆。它写进的是当前选中的库（面板上方的库选择器，只有一个库时就是它）。',
+            onClick: openCreate,
+          }, '＋ 新增'),
+          h('button', {
             key: 'd',
             style: css.button,
             disabled: busy !== '',
@@ -325,6 +376,77 @@ window.__ModuleLoader__.load({
           : null,
         !(state.error ?? state.snapshotError) && state.notice
           ? h('div', { key: 'notice', style: { ...css.stat, color: 'var(--dsw-alias-text-secondary, inherit)' } }, state.notice)
+          : null,
+        // V3.1 编辑表单：就地展开，不用弹窗（弹窗在这种设置页里容易被遮罩/层级坑住）
+        editor
+          ? h('div', { key: 'editor', style: css.card }, [
+              h('div', { key: 'h', style: css.meta },
+                editor.id ? `编辑这条（id=${editor.id}）` : '新增一条记忆'),
+              h('div', { key: 'r1', style: css.row }, [
+                h('select', {
+                  key: 'lv',
+                  style: { ...css.input, flex: '0 0 auto', minWidth: 140 },
+                  value: editor.level,
+                  onChange: (e) => setEditor((v) => ({ ...v, level: e.target.value })),
+                }, Object.keys(LEVEL_LABEL).map((lv) => h('option', { key: lv, value: lv }, LEVEL_LABEL[lv]))),
+                h('input', {
+                  key: 'ti',
+                  style: css.input,
+                  placeholder: '标题（可留空；索引里会退回正文前 20 字）',
+                  value: editor.title,
+                  onChange: (e) => setEditor((v) => ({ ...v, title: e.target.value })),
+                }),
+                h('select', {
+                  key: 'im',
+                  style: { ...css.input, flex: '0 0 auto', minWidth: 120 },
+                  value: String(editor.importance),
+                  onChange: (e) => setEditor((v) => ({ ...v, importance: Number(e.target.value) })),
+                }, [4, 3, 2, 1].map((n) => h('option', { key: `i${n}`, value: String(n) },
+                  `重要性 ${n}${n >= 3 ? '（压缩后会被补回）' : ''}`))),
+              ]),
+              h('textarea', {
+                key: 'ct',
+                style: { ...css.input, minHeight: 88, width: '100%', fontFamily: 'inherit', resize: 'vertical' },
+                placeholder: '内容（必填）。写成"下次新会话仍然需要知道"的样子；用户的原话请原样保留。',
+                value: editor.content,
+                onChange: (e) => setEditor((v) => ({ ...v, content: e.target.value })),
+              }),
+              h('div', { key: 'r2', style: css.row }, [
+                h('input', {
+                  key: 'kw',
+                  style: css.input,
+                  placeholder: '关键词（空格或逗号分隔，可留空）',
+                  value: editor.keywords,
+                  onChange: (e) => setEditor((v) => ({ ...v, keywords: e.target.value })),
+                }),
+                editor.level === 'project'
+                  ? h('input', {
+                      key: 'pj',
+                      style: css.input,
+                      placeholder: '项目名（选「项目」时必填）',
+                      value: editor.project,
+                      onChange: (e) => setEditor((v) => ({ ...v, project: e.target.value })),
+                    })
+                  : null,
+                editor.level === 'project'
+                  ? h('select', {
+                      key: 'sc',
+                      style: { ...css.input, flex: '0 0 auto', minWidth: 130 },
+                      value: editor.subcategory ?? '',
+                      onChange: (e) => setEditor((v) => ({ ...v, subcategory: e.target.value })),
+                    }, [['', '不分子类'], ['overview', '概览'], ['structure', '结构'], ['decisions', '决策'],
+                        ['quotes', '原话'], ['ops', '运维'], ['todo', '待办']]
+                      .map(([v, label]) => h('option', { key: v || 'none', value: v }, label)))
+                  : null,
+              ].filter(Boolean)),
+              h('div', { key: 'acts', style: css.row }, [
+                h('button', { key: 'sv', style: css.button, disabled: busy !== '', onClick: doSave },
+                  busy === 'save' ? '保存中…' : '保存'),
+                h('button', { key: 'cx', style: css.button, disabled: busy !== '', onClick: () => setEditor(null) }, '取消'),
+                h('span', { key: 'hint', style: css.stat },
+                  '保存后立刻生效（索引段与检索都会读到它），不用重启；含凭据类内容会被自动标记为敏感、不参与注入。'),
+              ]),
+            ])
           : null,
         state.loading
           ? h('div', { key: 'load', style: css.stat }, '读取中…')
@@ -349,6 +471,13 @@ window.__ModuleLoader__.load({
                   ? h('div', { key: 'k', style: css.meta }, e.keywords.slice(0, 13).map((k, i) => h(Tag, { key: `k${i}` }, k)))
                   : null,
                 h('div', { key: 'a', style: css.row }, [
+                  h('button', {
+                    key: 'ed',
+                    style: css.button,
+                    disabled: busy !== '',
+                    title: '编辑这条的内容 / 关键词 / 层级 / 重要性',
+                    onClick: () => openEdit(e),
+                  }, '编辑'),
                   e.status !== 'archived'
                     ? h('button', {
                         key: 'ar',

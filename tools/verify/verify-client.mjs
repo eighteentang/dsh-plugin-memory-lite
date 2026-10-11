@@ -39,6 +39,22 @@ uiImports.length === 0
 
 /__ModuleLoader__\.load\(/.test(source) ? ok('用 __ModuleLoader__.load 注册（客户端非 ESM）') : bad('用 __ModuleLoader__.load 注册');
 
+// ── 两端契约：客户端 `api('…')` 调的每个路径，服务端都必须注册了 ──────────
+// 为什么单独一条：路径字符串在两端各写一份，改了服务端忘了客户端（或反过来）
+// 就是"所有端点 404 而校验全绿"——这类事故在本项目已经发生过。
+{
+  const server = readFileSync(join(HERE, '..', '..', 'index.js'), 'utf8');
+  const called = [...new Set([...source.matchAll(/\bapi\(\s*'([^']+)'/g)].map((m) => m[1]))];
+  const registered = [...new Set([...server.matchAll(/API_PREFIX\}(\/[a-z][a-z-]*)/g)].map((m) => m[1]))];
+  const missing = called.filter((p) => !registered.includes(p));
+  missing.length === 0
+    ? ok('两端契约：客户端调的每个路径都有对应路由', `客户端 ${called.join(', ')} · 服务端 ${registered.join(', ')}`)
+    : bad('两端契约：有客户端调用却没有路由', missing.join(', '));
+  called.includes('/save')
+    ? ok('客户端已接上 /save（面板新增/编辑）')
+    : bad('客户端已接上 /save（面板新增/编辑）', called.join(', '));
+}
+
 // ── 造一个假运行环境 ─────────────────────────────────────────────────────
 const calls = { require: [], inject: [], register: [], elements: [] };
 

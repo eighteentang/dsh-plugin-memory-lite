@@ -459,6 +459,16 @@ console.log('=== verify-v1 ===\n');
   const disposed = [];
   const effectCleanups = [];
   const handlers = new Map();
+  // V3.1：假 ctx 也要提供 `inject`，否则 `ctx.inject(['webServer'], …)` 抛错、
+  // 整块 HTTP 路由注册不上 —— 那样"面板新增/编辑"就完全测不到了。
+  const routes = [];
+  const fakeWebServer = {
+    register(def) {
+      routes.push(def);
+      return () => disposed.push(`route:${def.path}`);
+    },
+  };
+  const services = { webServer: fakeWebServer };
 
   const fakeCtx = {
     logger: { info: () => {}, warn: () => {}, error: () => {} },
@@ -482,6 +492,11 @@ console.log('=== verify-v1 ===\n');
       return () => disposed.push(`on:${event}`);
     },
     get: () => undefined,
+    inject(names, cb) {
+      // 近似实现：把声明的服务交给回调（真实实现里未声明的服务会在取属性时抛）
+      const scoped = { get: (n) => (names.includes(n) ? services[n] : undefined) };
+      return cb ? cb(scoped) : scoped;
+    },
     effect(fn) {
       const cleanup = fn();
       if (typeof cleanup === 'function') effectCleanups.push(cleanup);
@@ -516,7 +531,59 @@ console.log('=== verify-v1 ===\n');
       : bad(`接线：注册了 ${evt}`);
   }
 
-  // 先往工作区库里放一条与 query 相关的记忆 —— 否则召回路径必然 0 命中，测不到"真的注入"
+  // ── V3.1：面板写入路由（/save）────────────────────────────────────────
+  // 为什么值得这么测：#save 是"面板能自己敲记忆"的唯一入口，而它的校验必须和
+  // 对话里的 memory_note 用同一套（normalizeEntryInput）—— 否则会出现
+  // "对话里写不进去的、面板里能写进去"。这里把真实 handler 抓出来直接调。
+  {
+    const saveRoute = routes.find((r) => String(r.path).endsWith('/save'));
+    saveRoute
+      ? ok('接线：注册了 /save 路由', `共 ${routes.length} 条路由`)
+      : bad('接线：注册了 /save 路由', routes.map((r) => r.path).join(', '));
+
+    const call = async (body) => {
+      let payload = null;
+      const res = { writeHead: () => {}, end: (s) => { try { payload = JSON.parse(s); } catch { payload = null; } } };
+      await saveRoute.handler({ url: '/dsh-memory-lite/api/save', body }, res);
+      return payload;
+    };
+    const dir = join(root, '.dsh-memory-test');
+
+    const created = await call({ dir, level: 'fact', content: '面板新增的测试条目，走 /save 路由', keywords: '面板,新增', importance: 3 });
+    created?.ok === true && created.created === true
+      ? ok('面板保存：新增成功', `id=${created.entry?.id}`)
+      : bad('面板保存：新增成功', JSON.stringify(created));
+
+    const empty = await call({ dir, content: '   ' });
+    empty?.ok === false ? ok('面板保存：空内容被拒', String(empty.error)) : bad('面板保存：空内容被拒', JSON.stringify(empty));
+
+    const badLevel = await call({ dir, level: '不存在的层级', content: '层级写错时的兜底', importance: 99 });
+    badLevel?.entry?.level === 'fact'
+      ? ok('面板保存：非法层级退到 fact（不炸）', badLevel.entry.level)
+      : bad('面板保存：非法层级兜底', JSON.stringify(badLevel));
+
+    const projMissing = await call({ dir, level: 'project', content: '项目层级但没写项目名' });
+    projMissing?.ok === false ? ok('面板保存：project 缺项目名被拒', String(projMissing.error)) : bad('面板保存：project 缺项目名被拒', JSON.stringify(projMissing));
+
+    const mm = openMemory({ dir });
+    const readBack = mm.get(badLevel?.entry?.id);
+    readBack?.importance === 4 ? ok('面板保存：越界重要性被夹到 4') : bad('面板保存：重要性夹取', String(readBack?.importance));
+
+    const upd = await call({ dir, id: created.entry.id, level: 'fact', content: '面板更新后的内容：关键词换成 蓝鲸', keywords: '蓝鲸', title: '面板写入测试', importance: 2 });
+    upd?.ok === true && upd.created === false ? ok('面板保存：编辑走更新分支') : bad('面板保存：编辑走更新分支', JSON.stringify(upd));
+
+    const hitNew = mm.search('蓝鲸', { status: 'active' });
+    const hitOld = mm.search('新增', { status: 'active' });
+    hitNew.some((e) => e.id === created.entry.id)
+      ? ok('面板保存：改完 FTS 已同步（新关键词能搜到）')
+      : bad('面板保存：改完 FTS 已同步', `命中 ${hitNew.length} 条`);
+    !hitOld.some((e) => e.id === created.entry.id)
+      ? ok('面板保存：旧关键词不再命中（FTS 无残影）')
+      : bad('面板保存：旧关键词残留', `命中 ${hitOld.length} 条`);
+
+    mm.close();
+  }
+
   {
     const seeded = openMemory({ dir: join(root, '.dsh-memory-test'), workspace: root });
     seeded.put({
@@ -615,6 +682,19 @@ console.log('=== verify-v1 ===\n');
     ask?.kind === 'ask' && ask.reason ? ok('审批闸门：破坏性工具转人工审批', ask.reason.slice(0, 40)) : bad('审批闸门：破坏性工具转人工审批', JSON.stringify(ask));
     const passed = await gate({ name: 'memory_forget' }, async () => ({ kind: 'reject', reason: '别的插件拒了' }));
     passed?.kind === 'reject' ? ok('审批闸门：不覆盖上游的 reject') : bad('审批闸门：不覆盖上游的 reject');
+  }
+
+  // 不带 dir 的分支放在**这里**测：前面跑过 pre-step 之后，工作区库才被 storeFor 登记进
+  // 注册表（"只有一个已知库"这个前提才成立）。放在前面测会变成"没有已知库 → 被守卫拒"，
+  // 那断言就成了必然通过的空话。
+  {
+    const saveRoute = routes.find((r) => String(r.path).endsWith('/save'));
+    let payload = null;
+    const res = { writeHead: () => {}, end: (s) => { try { payload = JSON.parse(s); } catch { payload = null; } } };
+    await saveRoute.handler({ url: '/dsh-memory-lite/api/save', body: { content: '不带 dir 的写入：应当落到唯一已知的工作区库' } }, res);
+    payload?.ok === true
+      ? ok('面板保存：不带 dir 时落到唯一的已知库', `created=${payload.created}`)
+      : bad('面板保存：不带 dir', JSON.stringify(payload));
   }
 
   // 释放

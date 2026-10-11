@@ -8,8 +8,44 @@
 **怎么钉版本**（避免"装到一半上游改了"）：
 
 ```sh
-dsh plugin --profile <你的profile名> add github:eighteentang/dsh-plugin-memory-lite#v1.3.0
+dsh plugin --profile <你的profile名> add github:eighteentang/dsh-plugin-memory-lite#v1.4.0
 ```
+
+---
+
+## [1.4.0] - 2026-10-12
+
+### 新增
+
+- **设置页「记忆控制」可以直接新增 / 编辑记忆了**（在这之前它只能看、搜、筛选、改状态 ——
+  想写一条只能去对话里说）。新增内容：
+  - 工具栏「＋ 新增」，每条记忆上的「编辑」；
+  - 表单字段：层级 / 内容 / 标题 / 关键词 / 重要性 / 项目 / 子类；
+  - 新路由 `POST /dsh-memory-lite/api/save`（新增与编辑共用，带 `id` 就是编辑）。
+
+- **校验与对话里完全同一套**：抽出了 `normalizeEntryInput()`，工具（`memory_note`）与面板
+  都走它 —— 否则会出现"对话里写不进去的、面板里能写进去"，而且没人会去逐处比对。
+  它与 `memory_note` 有两处**有意的差异**：关键词可选（面板是人手输入），
+  以及接受逗号/顿号/空格分隔的关键词串。
+  内容落库前同样过 `redactSecrets()`；凭据类内容会被标记为敏感、不参与注入。
+
+### 设计上的两条硬约束
+
+- **写哪个库必须由调用方显式指定**（`dir`）。面板没有 agent 上下文，"推断当前工作区"
+  在冷启动时必然落回 `$DSH_HOME/memory-lite/global` 那个空库（V2 真机踩过：面板显示 0 条）。
+  所以多库环境下没带 `dir` 直接拒绝，**不猜**。
+- **编辑语义保留**：`title` 不传 = 不改动这一列，传空串 = 清空。
+
+### 校验器
+
+- 170 → 197 → 205 → **227 项全绿**。
+- 新增两类断言：
+  - `verify-v1` 里给假 ctx 补上 `inject` + `webServer` 桩，把 **`/save` 的真实 handler
+    抓出来直接调**：新增成功、空内容被拒、非法层级兜底、`project` 缺项目名被拒、
+    越界重要性被夹取、编辑走更新分支、改完 **FTS 已同步**（新关键词命中 / 旧关键词无残影）。
+    （之前假 ctx 没有 `inject`，整块 HTTP 路由注册不上，面板相关的代码完全测不到。）
+  - `verify-client` 新增**两端契约**断言：客户端 `api('…')` 调的每个路径，
+    服务端必须注册了对应路由 —— 这类"两端各写一份字符串"的错在本项目发生过。
 
 ---
 
@@ -171,3 +207,4 @@ dsh plugin --profile <你的profile名> add github:eighteentang/dsh-plugin-memor
 [1.1.0]: https://github.com/eighteentang/dsh-plugin-memory-lite/releases/tag/v1.1.0
 [1.2.0]: https://github.com/eighteentang/dsh-plugin-memory-lite/releases/tag/v1.2.0
 [1.3.0]: https://github.com/eighteentang/dsh-plugin-memory-lite/releases/tag/v1.3.0
+[1.4.0]: https://github.com/eighteentang/dsh-plugin-memory-lite/releases/tag/v1.4.0

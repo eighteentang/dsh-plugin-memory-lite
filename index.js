@@ -21,7 +21,7 @@ import { openMemory, memoryDirFor, querySegments } from './lib/storage.js';
 import { renderIndexSection, renderRecallBlock, renderRecoveryBlock } from './lib/prompt.js';
 import { createInjectState, createInjectedMessage, isOwnInjection, lastUserText, stripOwnInjections, pickForInjection } from './lib/inject.js';
 import { captureTurn, extractTurnText } from './lib/capture.js';
-import { buildTools, DESTRUCTIVE_TOOLS } from './lib/tools.js';
+import { buildTools, DESTRUCTIVE_TOOLS, normalizeEntryInput } from './lib/tools.js';
 import { runDistill, shouldAutoDistill, resolveDistillTargets } from './lib/distill.js';
 
 export const name = 'dsh-plugin-memory-lite';
@@ -722,6 +722,58 @@ export const apply = (ctx, rawConfig = {}) => {
               if (!memory) return { ok: false, error: '记忆库不可用' };
               const next = memory.update(String(body.id ?? ''), { status: String(body.status ?? 'active') });
               return { ok: true, entry: { id: next.id, status: next.status } };
+            }),
+          }),
+          server.register({
+            kind: 'exact',
+            path: `${API_PREFIX}/save`,
+            /**
+             * 面板里"新增 / 编辑一条记忆"（V3.1）。
+             *
+             * 两条硬约束：
+             *   ① **写哪个库必须由调用方指定**（`dir`）。面板没有 agent 上下文，
+             *      "推断当前工作区"在冷启动时必然落回 `$DSH_HOME/memory-lite/global`
+             *      那个空库（V2 真机踩过：面板显示 0 条）。所以多库环境下没带 dir 就直接拒，
+             *      **不猜**。
+             *   ② 校验走 `normalizeEntryInput()` —— 与对话里的 `memory_note` **同一套规则**，
+             *      避免"对话写不进去的、面板能写进去"。
+             */
+            handler: makeHandler(async (req) => {
+              const body = await readBody(req);
+              const dir = dirFromRequest(req, body);
+              if (!dir) {
+                const known = listKnownStores();
+                if (known.length !== 1) {
+                  return {
+                    ok: false,
+                    error: `需要先指定记忆库（发现 ${known.length} 个库，不允许猜）`,
+                    stores: known.map((k) => k.label),
+                  };
+                }
+              }
+              const memory = resolveRouteStore(dir);
+              if (!memory) return { ok: false, error: '记忆库不可用' };
+
+              const normalized = normalizeEntryInput(body);
+              if (normalized.error) return { ok: false, error: normalized.error };
+
+              const id = body?.id ? String(body.id) : null;
+              try {
+                const entry = id ? memory.update(id, normalized.value) : memory.put(normalized.value);
+                return {
+                  ok: true,
+                  created: !id,
+                  entry: {
+                    id: entry.id,
+                    level: entry.level,
+                    status: entry.status,
+                    sensitive: entry.sensitive,
+                    injectCount: entry.injectCount ?? 0,
+                  },
+                };
+              } catch (error) {
+                return { ok: false, error: String(error?.message ?? error) };
+              }
             }),
           }),
           server.register({
