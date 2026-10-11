@@ -27,10 +27,14 @@ DSH 的会话本身是有记忆边界的：换一个会话、或者一次压缩�
 ## 安装
 
 ```
-dsh plugin add dsh-plugin-memory-lite
+dsh plugin --profile <你的profile名> add github:eighteentang/dsh-plugin-memory-lite#v1.1.0
 ```
 
-装完后重启客户端，设置页会出现 **「记忆控制」**。
+装完后**重启客户端**，设置页会出现 **「记忆控制」**。
+
+> **`#v1.1.0` 是版本钉子** —— 钉住版本避免"装到一半上游改了"。
+> 去掉 `#…` 就是跟随主分支（自动拿到新改动，也自动拿到新 bug）。
+> 全部版本见 [CHANGELOG.md](CHANGELOG.md)；升级就是把版本号换掉重新执行一次。
 
 > 开发期用 `link:` 装（`link:D:/path/to/memory-lite`）也是支持的，
 > 但**必须保留 `peerDependencies`**，否则插件的包解析会失败。
