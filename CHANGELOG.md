@@ -45,6 +45,16 @@ dsh plugin --profile <你的profile名> add github:eighteentang/dsh-plugin-memor
 
 ### 修复（开发期实测发现的问题）
 
+- **蒸馏调用没给 `provider` → `NO_ADAPTER`**：`ctx.llm.stream()` 的 `provider` **不能省**
+  （框架没有全局默认提供方；参照 `dsh-compaction-basic`，它用的是自己配置的
+  `summarizationProvider` / `summarizationModel`）。现在显式配置优先，
+  否则从 `ctx.llm.listProviders()` / `listModels()` 发现候选并**逐个尝试**
+  （`NO_ADAPTER` / 凭据类失败就换下一个），成功的那对会记进 `distill_runs.note`
+- **正常结束被误判成错误**：`{type:'finish', reason:'stop'}` 的 `reason` 是**字符串**，
+  第一版把它也当失败 → 每次整理都报「模型流错误：stop」。
+  现在只有对象形态的 `reason` / `failure`（带 kind/code）才算失败
+- **前端吞掉真实错误**：失败时界面只显示「整理未完成：error」
+  （代码优先显示 `reason`，而它恒为 `"error"`），真正的 `message` 被丢掉。现在显示完整原因
 - **蒸馏提示词构造的 TDZ**：`const known = ... ${known.map(...)}` —— 在变量自己的初始化
   表达式里引用它，命中暂时性死区直接抛 `Cannot access 'known' before initialization`。
   **只在「已有记忆标题非空」时触发**，空库第一次整理反而正常

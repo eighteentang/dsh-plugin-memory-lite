@@ -246,23 +246,53 @@ $t = [System.IO.File]::ReadAllText($p, [System.Text.Encoding]::UTF8)
 
 ```js
 for await (const chunk of ctx.llm.stream({
-  provider: 'deepseek-official',   // 可省略 → 用会话当前模型
-  model: 'deepseek-v4-flash',      // 同上
+  provider: 'deepseek-official',   // ⚠ 必给！不能省 —— 见下面第三条坑
+  model: 'deepseek-v4-flash',
   messages: [{ role: 'user', content: [{ type: 'text', text: 'Hello' }] }],
 })) {
   // 分片类型：block-start, text-delta, ..., usage, finish
 }
 ```
 
-**我踩的坑（两处同时错，症状却是同一个）：**
+**我踩的坑（三处，症状各不相同）：**
 
 | 我写的 | 真实契约 | 后果 |
 |---|---|---|
 | `{ system, prompt, maxTokens }` | `{ messages: [{role, content:[{type:'text',text}]}] }` | 模型收到空输入 |
-| `await ctx.llm.stream(...)` | 它返回**异步可迭代**，要 `for await` 消费 `text-delta` | `await` 只拿到迭代器本身 → 文本长度 0 |
+| `await ctx.llm.stream(...)` | 返回**异步可迭代**，要 `for await` 消费 `text-delta` | 拿到迭代器本身 → 文本长度 0 |
+| **省略 `provider`** | **必给**（框架没有全局默认提供方） | `NO_ADAPTER: no adapter registered for provider "undefined"` |
 
 **症状**：`distill_runs` 里 `outcome=ok, created=0, note="模型未产出条目（raw 长度 0）"`。
 **判据**：看到「调用成功但产出为空」时，**先核对参数名与消费方式**，别急着改提示词。
+
+**关于 provider（2026-10-11 真机第二次失败）**：
+
+文档里"direct call 会用已配置的提供方/模型对，回退到最近一次已记录请求目标，
+再回退到 AgentOptions"这句话**误导了我** —— 实测省略 provider 直接失败。
+参照 `dsh-compaction-basic`：它用的是**自己的配置项** `summarizationProvider` /
+`summarizationModel`。**结论：框架没有全局默认提供方，每个调用方都得自己指定。**
+
+正确做法（已实现，见 `resolveDistillTargets()`）：
+
+1. 显式配置优先（`config.distillProvider` / `distillModel`）
+2. 否则从 **`ctx.llm.listProviders()`**（同步，按注册顺序）逐个发现，
+   各取 **`ctx.llm.listModels(provider)`**（**异步**，返回 `{provider,id,name,…}`）的第一个模型
+3. **按顺序尝试**：遇到 `NO_ADAPTER` / `MISSING_CREDENTIAL` / `INVALID_CREDENTIAL` / `AUTH`
+   就换下一个；其它错误（如 `CONTEXT_WINDOW_EXCEEDED`）直接放弃，不浪费尝试
+4. 一个候选都没有 → 返回 `no-provider` 并提示去配置（而不是抛 NO_ADAPTER 谜题）
+
+**失败分片的真实形状**：`{ type:'finish', reason:{ kind:'error', failure:{ code, message } } }`
+（注意是 `reason.failure`，不是顶层 `failure`）。稳定 code：`NO_ADAPTER` /
+`MISSING_CREDENTIAL` / `INVALID_CREDENTIAL` / `AUTH` / `RATE_LIMIT` / `CONTEXT_WINDOW_EXCEEDED`。
+**按 code 处理，不要解析消息文本。**
+
+> ⚠ **一个被校验器抓到的误判**：正常结束分片是 `{ type:'finish', reason:'stop' }` ——
+> `reason` 是**字符串**。我第一版把"字符串 reason"也当失败，于是每次整理都会报
+> `模型流错误：stop`。**判据：只有对象形态的 reason（带 kind/failure）才是失败。**
+> 这个 bug 在真机上会表现为"永远报错"，是 `verify-v2` 第 ⑤ 组断言拦下来的。
+
+**诊断手段**：宿主路由 `GET /dsh-memory-lite/api/llm-probe` 返回这台机器上
+实际注册的提供方、各自的模型、以及解析出的候选列表 —— 排查"模型调不通"先看它。
 
 **顺带修掉的一类隐患**：流里的 `error` 分片、或空内容，**必须判失败**，
 不能记成 `outcome=ok` —— 否则失败会伪装成"整理成功但没内容"，谁也发现不了。
@@ -306,6 +336,15 @@ $N = "C:\Users\10454\.dsh\dsh-runtimes\dsh-primary-runtime\dependencies\node\bin
 & $N D:\DSH-dev\memory-lite\tools\release\release-copy.mjs           # 演练（不写）
 & $N D:\DSH-dev\memory-lite\tools\release\release-copy.mjs --apply   # 真复制
 ```
+
+**git 仓库在开发目录**（`D:\DSH-dev\memory-lite`，2026-10-11 首次提交 `cf0f213`），
+**不在用户包**。理由：版本控制应该覆盖校验器、诊断脚本、AGENTS.md 这些工程资产，
+而它们按约定不许进用户包 —— 若把仓库建在用户包里，这些资产就落不进版本库。
+对外发布由 `package.json` 的 `files` 字段门控，与仓库位置无关。
+
+> 对比 im-bridge：它的开发目录**就是**产品目录（`D:\EasyDSH\im-bridge`，profile 直接链到那里），
+> 所以它的 `.git` 在用户包里 —— 那不是矛盾，是因为它没有单独的开发目录。
+> **发布副本（`D:\EasyDSH\memory-lite`）是构建产物**：改了 DSH-dev 的源码后必须重跑发布脚本，否则两边会漂移。
 
 **为什么是白名单而不是黑名单**：黑名单一定会漏（"靠记得排除什么"是本项目反复失败的模式）。
 脚本还会①清掉目标目录里不在白名单的残留；②**在自检里拦开发产物**；

@@ -22,7 +22,7 @@ import { renderIndexSection, renderRecallBlock, renderRecoveryBlock } from './li
 import { createInjectState, createInjectedMessage, isOwnInjection, lastUserText, stripOwnInjections, pickForInjection } from './lib/inject.js';
 import { captureTurn, extractTurnText } from './lib/capture.js';
 import { buildTools, DESTRUCTIVE_TOOLS } from './lib/tools.js';
-import { runDistill, shouldAutoDistill } from './lib/distill.js';
+import { runDistill, shouldAutoDistill, resolveDistillTargets } from './lib/distill.js';
 
 export const name = 'dsh-plugin-memory-lite';
 export const inject = ['tools', 'systemPrompt'];
@@ -683,6 +683,34 @@ export const apply = (ctx, rawConfig = {}) => {
               if (!memory) return { ok: false, error: '记忆库不可用' };
               const next = memory.update(String(body.id ?? ''), { status: String(body.status ?? 'active') });
               return { ok: true, entry: { id: next.id, status: next.status } };
+            }),
+          }),
+          server.register({
+            kind: 'exact',
+            path: `${API_PREFIX}/llm-probe`,
+            // 诊断路由：宿主这边到底注册了哪些提供方、各自有哪些模型。
+            // 加它的理由：蒸馏第一次真机失败是 `NO_ADAPTER: provider "undefined"`，
+            // 而当时我**看不到这台机器上实际有哪些路由可用**，只能靠猜。
+            handler: makeHandler(async () => {
+              const llm = typeof ctx.get === 'function' ? ctx.get('llm') : ctx.llm;
+              if (!llm) return { ok: false, error: 'ctx.llm 不可用' };
+              let providers = [];
+              try {
+                providers = typeof llm.listProviders === 'function' ? llm.listProviders() : [];
+              } catch (error) {
+                return { ok: false, error: `listProviders 失败：${String(error?.message ?? error).slice(0, 200)}` };
+              }
+              const models = {};
+              for (const p of Array.isArray(providers) ? providers : []) {
+                try {
+                  const list = typeof llm.listModels === 'function' ? await llm.listModels(p) : [];
+                  models[p] = (Array.isArray(list) ? list : []).slice(0, 8).map((m) => ({ id: m?.id, name: m?.name }));
+                } catch (error) {
+                  models[p] = `失败：${String(error?.message ?? error).slice(0, 120)}`;
+                }
+              }
+              const resolvedTargets = await resolveDistillTargets({ llm, config });
+              return { ok: true, providers, models, resolvedTargets };
             }),
           }),
           server.register({

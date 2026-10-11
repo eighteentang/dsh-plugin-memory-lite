@@ -17,7 +17,7 @@ import { join } from 'node:path';
 import { openMemory } from '../../lib/storage.js';
 import { resolveConfig } from '../../lib/config.js';
 import { buildTools, brief } from '../../lib/tools.js';
-import { shouldAutoDistill } from '../../lib/distill.js';
+import { shouldAutoDistill, runDistill, resolveDistillTargets } from '../../lib/distill.js';
 
 const results = [];
 const ok = (n, d = '') => results.push({ pass: true, n, d });
@@ -155,6 +155,90 @@ try {
   // 参数形状：新增的 scope 必须出现在 schema 里（不是靠模型猜）
   const scopeProp = tools.find((t) => t.name === 'memory_search')?.parameters?.properties?.scope;
   scopeProp?.enum?.includes('all') ? ok('scope 参数在 JSON Schema 里声明（含 all）') : bad('scope 参数在 JSON Schema 里声明', JSON.stringify(scopeProp));
+
+  // ── ⑤ 蒸馏的「提供方解析 + 逐个试」（真机 NO_ADAPTER 教出来的）────────────
+  // 真机错误原文：{"kind":"error","failure":{"message":"no adapter registered for
+  //              provider \"undefined\"","code":"NO_ADAPTER"}}
+  // 根因：省略 provider 直接调 ctx.llm.stream() —— **框架没有全局默认提供方**。
+  // 这一段把"必须自己指定 + 一个不行就换下一个"固化成断言。
+  {
+    const root3 = mkdtempSync(join(tmpdir(), 'memprov-'));
+    const mem = openMemory({ dir: join(root3, 'mem') });
+    mem.appendLog({ sessionId: 'sp', turn: 1, text: `提供方测试内容。${'q'.repeat(220)}` });
+    const cfgD = resolveConfig({ autoDistill: true });
+    const json = JSON.stringify({ items: [{ level: 'fact', content: '提供方解析测试条目', keywords: ['提供方'], importance: 2, project: '全局' }] });
+    const gen = (chunks) => (async function* g() { for (const c of chunks) yield c; })();
+    const okChunks = () => [{ type: 'text-delta', text: json }, { type: 'finish', reason: 'stop' }];
+
+    // ① 没有任何注册路由 → 候选为空（不能拿 undefined 去调用）
+    const emptyTargets = await resolveDistillTargets({ llm: { listProviders: () => [], listModels: async () => [] }, config: cfgD });
+    emptyTargets.length === 0 ? ok('无注册路由时解析出空候选（不会拿 undefined 去调用）') : bad('无注册路由时解析出空候选', JSON.stringify(emptyTargets));
+
+    const r0 = await runDistill({ memory: mem, config: cfgD, llm: { listProviders: () => [], listModels: async () => [], stream: () => gen(okChunks()) }, force: true });
+    r0?.reason === 'no-provider'
+      ? ok('无提供方时返回 no-provider（可指导用户去配置，而不是抛 NO_ADAPTER 谜题）')
+      : bad('无提供方时返回 no-provider', JSON.stringify(r0));
+
+    // ② 第一个提供方 NO_ADAPTER → 自动换下一个并成功
+    const tried = [];
+    const flaky = {
+      listProviders: () => ['dead-route', 'good-route'],
+      listModels: async (p) => [{ id: `model-of-${p}`, name: p }],
+      stream(options) {
+        tried.push(options.provider);
+        if (options.provider === 'dead-route') {
+          return gen([{ type: 'finish', reason: { kind: 'error', failure: { code: 'NO_ADAPTER', message: 'no adapter registered for provider "dead-route"' } } }]);
+        }
+        return gen(okChunks());
+      },
+    };
+    const r1 = await runDistill({ memory: mem, config: cfgD, llm: flaky, force: true });
+    r1?.ok === true && r1.via === 'good-route/model-of-good-route'
+      ? ok('第一个提供方 NO_ADAPTER → 自动换下一个并成功', `试过 ${tried.join(' → ')}；成功 ${r1.via}`)
+      : bad('第一个提供方 NO_ADAPTER → 自动换下一个并成功', JSON.stringify({ r1, tried }));
+    tried.length === 2 ? ok('只试了必要次数（不重复试同一个）', String(tried.length)) : bad('只试了必要次数', String(tried.length));
+
+    // ③ 不可换的错误（上下文超限）→ 不浪费时间换提供方
+    // ⚠ 每次都要补一条**新流水**：上一次成功的运行会 markDistilledUpTo，
+    //   否则后续用例一律 `no-logs`（我第一次就踩了这个，三个用例连着假红）。
+    mem.appendLog({ sessionId: 'sp', turn: 2, text: `上下文超限用例。${'q'.repeat(220)}` });
+    const tried2 = [];
+    const overflow = {
+      listProviders: () => ['a', 'b'],
+      listModels: async () => [{ id: 'm' }],
+      stream(options) {
+        tried2.push(options.provider);
+        return gen([{ type: 'finish', reason: { kind: 'error', failure: { code: 'CONTEXT_WINDOW_EXCEEDED', message: 'too long' } } }]);
+      },
+    };
+    const r2 = await runDistill({ memory: mem, config: cfgD, llm: overflow, force: true });
+    r2?.ok === false && tried2.length === 1
+      ? ok('不可换的错误（CONTEXT_WINDOW_EXCEEDED）不浪费一次尝试')
+      : bad('不可换的错误不换提供方', JSON.stringify({ r2, tried2 }));
+
+    // ④ 传进去的 options 必须带 provider + model（这正是真机 NO_ADAPTER 的直接修复）
+    mem.appendLog({ sessionId: 'sp', turn: 3, text: `参数形状用例。${'q'.repeat(220)}` });
+    let seenOptions = null;
+    const spy = {
+      listProviders: () => ['only'],
+      listModels: async () => [{ id: 'only-model' }],
+      stream(options) { seenOptions = options; return gen(okChunks()); },
+    };
+    await runDistill({ memory: mem, config: cfgD, llm: spy, force: true });
+    seenOptions?.provider === 'only' && seenOptions?.model === 'only-model'
+      ? ok('调用时带上了 provider 与 model（真机 NO_ADAPTER 的直接修复）')
+      : bad('调用时带上了 provider 与 model', JSON.stringify(seenOptions));
+    Array.isArray(seenOptions?.messages) ? ok('同时仍然带 messages（签名没写坏）') : bad('同时仍然带 messages', JSON.stringify(Object.keys(seenOptions ?? {})));
+
+    // ⑤ 显式配置优先于自动发现
+    const explicit = await resolveDistillTargets({ llm: { listProviders: () => ['auto'], listModels: async () => [{ id: 'automodel' }] }, config: resolveConfig({ distillProvider: 'mine', distillModel: 'mymodel' }) });
+    explicit[0]?.provider === 'mine' && explicit[0]?.model === 'mymodel'
+      ? ok('显式配置的 distillProvider/distillModel 优先')
+      : bad('显式配置优先', JSON.stringify(explicit));
+
+    mem.close();
+    rmSync(root3, { recursive: true, force: true });
+  }
 } finally {
   A.close();
   B.close();

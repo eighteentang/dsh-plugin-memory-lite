@@ -248,6 +248,11 @@ console.log('=== verify-v1 ===\n');
     ],
   });
   const fakeLlm = {
+    // ⚠ 必须同时实现 listProviders / listModels：真机上 `provider` **不能省**
+    //   （省略会 `NO_ADAPTER: provider "undefined"`）。假 LLM 只实现 stream 的话，
+    //   模拟的不是真实契约，也测不到"候选解析"那一步。
+    listProviders: () => ['fake-route'],
+    listModels: async () => [{ id: 'fake-model', name: 'Fake' }],
     stream(options) {
       capturedOptions = options;
       const pieces = jsonPayload.match(/[\s\S]{1,40}/g) ?? [];

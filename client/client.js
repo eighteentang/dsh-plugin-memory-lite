@@ -220,8 +220,18 @@ window.__ModuleLoader__.load({
             setState((s) => ({ ...s, error: null, notice: '最近连续整理失败，已进入退避状态，过一会儿再试。' }));
           } else if (reason === 'llm-unavailable') {
             setState((s) => ({ ...s, error: '拿不到模型服务（ctx.llm），无法整理。请把这条告诉我。', notice: null }));
+          } else if (reason === 'no-provider') {
+            setState((s) => ({
+              ...s,
+              error: null,
+              notice: `找不到可用的模型提供方。${out?.result?.message ?? ''} 可以在插件配置里指定 distillProvider / distillModel。`,
+            }));
           } else if (out?.ok === false) {
-            setState((s) => ({ ...s, error: `整理未完成：${reason ?? out?.result?.message ?? '未知原因'}`, notice: null }));
+            // ⚠ 这里曾经优先显示 `reason`，而失败的 reason 恒为 "error"，
+            //   于是真正的错误消息（在 result.message 里）**被吞掉**，界面上只剩一个 "error"。
+            //   用户看到的「整理未完成，error」就是这么来的 —— 前端把唯一的证据丢了。
+            const detail = out?.result?.message ?? reason ?? '未知原因';
+            setState((s) => ({ ...s, error: `整理未完成：${detail}`, notice: null }));
           } else if ((out?.result?.items ?? 0) === 0) {
             setState((s) => ({
               ...s,
