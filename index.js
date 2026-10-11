@@ -19,9 +19,10 @@ import { existsSync, mkdirSync, readdirSync, readFileSync, writeFileSync } from 
 import { Config as MemoryConfig, resolveConfig, redactSecrets, RECALL_RUN_KEEP } from './lib/config.js';
 import { openMemory, memoryDirFor, querySegments } from './lib/storage.js';
 import { renderIndexSection, renderRecallBlock, renderRecoveryBlock } from './lib/prompt.js';
-import { createInjectState, createInjectedMessage, isOwnInjection, lastUserText, stripOwnInjections, pickForInjection } from './lib/inject.js';
+import { createInjectState, createInjectedMessage, isOwnInjection, lastUserText, stripOwnInjections, pickForInjection, mergeRecallCandidates, memoryFingerprint } from './lib/inject.js';
 import { captureTurn, extractTurnText } from './lib/capture.js';
 import { buildTools, DESTRUCTIVE_TOOLS, normalizeEntryInput } from './lib/tools.js';
+import { readPersona, writePersona, renderPersonaSection } from './lib/persona.js';
 import { runDistill, shouldAutoDistill, resolveDistillTargets } from './lib/distill.js';
 
 export const name = 'dsh-plugin-memory-lite';
@@ -29,6 +30,8 @@ export const inject = ['tools', 'systemPrompt'];
 export { MemoryConfig as Config };
 
 const DSH_HOME = process.env.DSH_HOME || join(homedir(), '.dsh');
+/** 人设 / 工作规范存放目录 —— 内容就是那两个文本框的内容，插件自己的文件 */
+const PERSONA_DIR = join(DSH_HOME, 'memory-lite', 'persona');
 
 function trace(logger, event, data) {
   try {
@@ -171,6 +174,27 @@ export const apply = (ctx, rawConfig = {}) => {
     }
   }
 
+  /**
+   * 用户级（跨工作区）记忆库 —— 目录就是 `dirForWorkspace(null)` 的现成路径
+   * （`$DSH_HOME/memory-lite/global`），**不发明新位置**。
+   *
+   * ⚠ 这里刻意**不登记进注册表**：注册表是"工作区库"的清单，混进一个 workspace=null
+   * 的条目会让面板看着像多了一个工作区（这是当初"面板显示 0 条"那个坑的邻居）。
+   * 面板要显示它，走 listKnownStores 里显式加的那一条（`kind:'user'`）。
+   *
+   * 用 storeFor(null) 而不是 storeByDir()：两者缓存键不同（`dir:` 前缀 vs 裸路径），
+   * 同一目录会被打开成两个数据库句柄。
+   */
+  function globalStoreFor() {
+    if (!config.globalMemory) return null;
+    return storeFor(null);
+  }
+
+  /** 用户级库的目录（不论开关） */
+  function globalMemoryDir() {
+    return dirForWorkspace(null, config.dirName);
+  }
+
   function workspaceOf(agent) {
     try {
       const cwd = agent?.session?.header?.cwd;
@@ -205,6 +229,15 @@ export const apply = (ctx, rawConfig = {}) => {
     }
     for (const info of knownStoreDirs()) push(info.dir, info.workspace ?? null);
     if (lastWorkspace) push(dirForWorkspace(lastWorkspace, config.dirName), lastWorkspace);
+    // V1.7：用户级库也要能被 scope="all" 搜到 —— 它不在注册表里（有意），所以这里显式补上
+    // （不补的话"跨工作区检索"会漏掉唯一真正跨工作区的那一份）
+    const gdir = globalMemoryDir();
+    if (config.globalMemory && existsSync(join(gdir, 'memory.db'))) {
+      const gmem = globalStoreFor();
+      if (gmem && !out.some((s) => s.memory === gmem)) {
+        out.push({ label: '用户级（跨工作区）', workspace: null, kind: 'user', memory: gmem });
+      }
+    }
     return out;
   }
 
@@ -250,7 +283,10 @@ export const apply = (ctx, rawConfig = {}) => {
       const definitions = buildTools({
         memory: registry,
         config,
-        resolveMemory: (exec) => storeFor(workspaceOf(exec?.agent)),
+        // V1.7：显式 scope —— "user" 走用户级库（跨工作区），其余走当前工作区库
+        resolveMemory: (exec, opts) => (opts?.scope === 'user' ? globalStoreFor() ?? storeFor(workspaceOf(exec?.agent)) : storeFor(workspaceOf(exec?.agent))),
+        // V1.7：按 id 的工具（read/update/forget）自动认库 —— 主库里没有就回退用户级库
+        fallbackMemory: () => globalStoreFor(),
         // V2-4：跨工作区检索用 —— 让工具能看到全部已知库
         listStores: () => listAllStores(),
         findStoreByLabelOrDir: (needle) => {
@@ -311,6 +347,37 @@ export const apply = (ctx, rawConfig = {}) => {
           } catch (error) {
             trace(ctx?.logger, 'index-render-FAILED', { message: String(error?.message ?? error).slice(0, 200) });
             return '（记忆库读取失败）';
+          }
+        },
+      });
+    }),
+  );
+
+  // ── 3·五. 人设 / 工作规范段（V1.6：插件自己的文件，注入到框架的人设位置）──────
+  // 为什么用 systemPrompt 段落而不是写进用户的 AGENTS.md：
+  //   框架自己就有人设槽位（SECTION_ORDERS 里的 DEPLOYMENT_PERSONA_PREFIX = 0、后缀 = 10200），
+  //   而 `systemPrompt.section` 正是"每轮必到"的机制。第一版我去改写用户的 AGENTS.md 并
+  //   用自加的 `### 标题` 当锚点，于是"标题不能删"变成了对用户的约束（用户原话：不合理）。
+  //   现在：内容存在插件自己的两个 .md 文件里（文件内容 = 文本框内容，零解析），
+  //   段落紧跟框架的人设前缀（order + 1），保存后下一轮立刻生效。
+  disposers.push(
+    guarded(ctx?.logger, 'persona-section', () => {
+      const section = ctx.systemPrompt?.section;
+      if (typeof section !== 'function') throw new Error('ctx.systemPrompt.section 不可用');
+      const base = typeof ctx.systemPrompt.getSectionOrder === 'function'
+        ? ctx.systemPrompt.getSectionOrder('DEPLOYMENT_PERSONA_PREFIX')
+        : 0;
+      const order = (Number.isFinite(base) ? base : 0) + 1; // 紧跟框架自己的人设段
+      return section({
+        name: 'memory-lite:persona',
+        order,
+        interpolate: false, // 人设正文里可能有 {{ }}；这里不做变量插值
+        text: () => {
+          try {
+            return renderPersonaSection(readPersona(PERSONA_DIR));
+          } catch (error) {
+            trace(ctx?.logger, 'persona-render-FAILED', { message: String(error?.message ?? error).slice(0, 200) });
+            return '';
           }
         },
       });
@@ -393,7 +460,12 @@ export const apply = (ctx, rawConfig = {}) => {
           const query = lastUserText(incoming);
           if (!query || query.length < 4) return decision;
 
-          const candidates = memory.search(query, { status: 'active', limit: 12 });
+          // V1.7：候选 = 当前工作区库 + 用户级库（合并去重、共享名额）。
+          // 顺序有意为之：工作区放第 0 个 —— 同分时它优先（"项目里的事"比"用户级的事"更具体）。
+          const sources = [{ memory, tag: 'workspace' }];
+          const userMemory = globalStoreFor();
+          if (userMemory && userMemory !== memory) sources.push({ memory: userMemory, tag: 'user' });
+          const candidates = mergeRecallCandidates(sources, query, { limitPerStore: 12 });
           const picked = pickForInjection(candidates, {
             sessionId,
             seen: injectState.seen(sessionId),
@@ -426,18 +498,34 @@ export const apply = (ctx, rawConfig = {}) => {
           const entered = decision.messages.toSpliced(lastClaimed + 1, 0, message);
           injectState.mark(sessionId, picked.map((p) => p.id));
           // V2-1 注入可见性：逐轮记账（面板据此显示"这条被用过几次 / 最近一次"）
+          // ⚠ V1.7 起要**按条目所属的库**分开记：
+          //   · injections 日志行记在工作区库（会话在哪就记在哪，面板读的是它）
+          //   · 用户级条目的 inject_count 必须落在用户级库 —— 否则面板上它永远是"未用过"
+          const userIds = picked.filter((p) => p._scope === 'user').map((p) => p.id);
           try {
             memory.recordInjection({
               sessionId,
               workspace: workspaceOf(agent),
               form: 'recall',
-              entryIds: picked.map((p) => p.id),
+              entryIds: picked.filter((p) => p._scope !== 'user').map((p) => p.id),
               chars: text.length,
             });
           } catch (error) {
             trace(ctx?.logger, 'record-injection-FAILED', { message: String(error?.message ?? error).slice(0, 160) });
           }
-          trace(ctx?.logger, 'recall-injected', { sessionId, ids: picked.map((p) => p.id), chars: text.length });
+          if (userIds.length && userMemory) {
+            try {
+              userMemory.bumpInjected(userIds);
+            } catch (error) {
+              trace(ctx?.logger, 'record-user-injection-FAILED', { message: String(error?.message ?? error).slice(0, 160) });
+            }
+          }
+          trace(ctx?.logger, 'recall-injected', {
+            sessionId,
+            ids: picked.map((p) => p.id),
+            fromUser: userIds.length,
+            chars: text.length,
+          });
           return { ...decision, messages: entered };
         } catch (error) {
           trace(ctx?.logger, 'recall-FAILED', { message: String(error?.message ?? error).slice(0, 200) });
@@ -471,11 +559,18 @@ export const apply = (ctx, rawConfig = {}) => {
           const memory = storeFor(workspaceOf(payload?.agent));
           if (!memory) return decision;
           // 压缩后补回「常驻层」（user/rules + 重要性≥3 的条目）
+          // V1.7：用户级库的常驻条目也要补回（那正是"用户级长期记忆"的意义 ——
+          //   压缩后不能只把工作区的东西捡回来）。判重仍用内容指纹：两个库的 id 不同。
+          const residentOf = (mem, tag) => (mem ? [
+            ...mem.activeOf('user'),
+            ...mem.activeOf('rules'),
+            ...mem.list({ status: 'active', limit: 60 }).filter((e) => e.importance >= 3),
+          ].map((e) => ({ ...e, _scope: tag })) : []);
+          const userMem = globalStoreFor();
           const resident = [
-            ...memory.activeOf('user'),
-            ...memory.activeOf('rules'),
-            ...memory.list({ status: 'active', limit: 60 }).filter((e) => e.importance >= 3),
-          ].filter((e, i, arr) => !e.sensitive && arr.findIndex((x) => x.id === e.id) === i);
+            ...residentOf(memory, 'workspace'),
+            ...(userMem && userMem !== memory ? residentOf(userMem, 'user') : []),
+          ].filter((e, i, arr) => !e.sensitive && arr.findIndex((x) => memoryFingerprint(x) === memoryFingerprint(e)) === i);
           const text = renderRecoveryBlock(resident.slice(0, config.injectMaxItems + 2), { maxChars: config.injectMaxChars });
           if (!text) return decision;
           const message = createInjectedMessage(text, { form: 'recovery' });
@@ -487,13 +582,21 @@ export const apply = (ctx, rawConfig = {}) => {
               sessionId,
               workspace: workspaceOf(payload?.agent),
               form: 'recovery',
-              entryIds: resident.map((r) => r.id),
+              entryIds: resident.filter((r) => r._scope !== 'user').map((r) => r.id),
               chars: text.length,
             });
           } catch (error) {
             trace(ctx?.logger, 'record-recovery-FAILED', { message: String(error?.message ?? error).slice(0, 160) });
           }
-          trace(ctx?.logger, 'recovery-injected', { sessionId, count: resident.length });
+          const userResidentIds = resident.filter((r) => r._scope === 'user').map((r) => r.id);
+          if (userResidentIds.length && userMem) {
+            try {
+              userMem.bumpInjected(userResidentIds);
+            } catch {
+              /* 计数失败不影响注入 */
+            }
+          }
+          trace(ctx?.logger, 'recovery-injected', { sessionId, count: resident.length, fromUser: userResidentIds.length });
           return { ...decision, messages: decision.messages.toSpliced(lastClaimed + 1, 0, message) };
         } catch (error) {
           trace(ctx?.logger, 'recovery-FAILED', { message: String(error?.message ?? error).slice(0, 200) });
@@ -562,11 +665,12 @@ export const apply = (ctx, rawConfig = {}) => {
        */
       const listKnownStores = () => {
         const found = [];
+        const find = (dir) => found.find((f) => f.dir.toLowerCase() === String(dir).toLowerCase());
         const add = (dir, workspaceHint = null) => {
           if (!dir) return;
           const dbFile = join(dir, 'memory.db');
           if (!existsSync(dbFile)) return;
-          if (found.some((f) => f.dir.toLowerCase() === String(dir).toLowerCase())) return;
+          if (find(dir)) return;
           // 工作区名优先用注册表里的提示；否则读库内 meta（库自己记着 workspace）
           let workspace = workspaceHint;
           if (!workspace) {
@@ -578,7 +682,15 @@ export const apply = (ctx, rawConfig = {}) => {
               workspace = null;
             }
           }
-          found.push({ dir, workspace: workspace ?? null, label: workspace ?? dir });
+          // V1.7：用户级库（workspace=null 的那份）也要给面板看 —— 否则用户在面板里
+          // 永远看不到自己刚写进去的用户级记忆，只能靠搜
+          const isUserLevel = String(dir).toLowerCase() === globalMemoryDir().toLowerCase();
+          found.push({
+            dir,
+            workspace: workspace ?? null,
+            label: isUserLevel ? '用户级（跨工作区）' : (workspace ?? dir),
+            kind: isUserLevel ? 'user' : 'workspace',
+          });
         };
 
         // ① 权威来源：注册表（storeFor 每次打开工作区库都会登记）
@@ -596,7 +708,8 @@ export const apply = (ctx, rawConfig = {}) => {
         } catch {
           /* 忽略 */
         }
-        return found.filter((f) => f.workspace); // 只把"真正的工作区库"给面板看
+        // 只把"真正的工作区库"和"用户级库"给面板看（其他哈希目录是拿不到工作区时的兜底）
+        return found.filter((f) => f.workspace || f.kind === 'user');
       };
 
       const snapshotOf = (memory) => ({
@@ -635,7 +748,7 @@ export const apply = (ctx, rawConfig = {}) => {
           if (!memory) continue;
           if (seen.has(memory.dbPath.toLowerCase())) continue;
           seen.add(memory.dbPath.toLowerCase());
-          stores_.push({ label: info.label, ...snapshotOf(memory) });
+          stores_.push({ label: info.label, kind: info.kind ?? 'workspace', dir: info.dir, ...snapshotOf(memory) });
         }
         if (!stores_.length) {
           const fallback = storeForPanel();
@@ -740,18 +853,27 @@ export const apply = (ctx, rawConfig = {}) => {
              */
             handler: makeHandler(async (req) => {
               const body = await readBody(req);
+              // V1.7：写哪个库要**显式**指定 —— scope="user" 写用户级库；否则按 dir 定位工作区库。
+              const scope = body?.scope === 'user' ? 'user' : 'workspace';
               const dir = dirFromRequest(req, body);
-              if (!dir) {
-                const known = listKnownStores();
-                if (known.length !== 1) {
-                  return {
-                    ok: false,
-                    error: `需要先指定记忆库（发现 ${known.length} 个库，不允许猜）`,
-                    stores: known.map((k) => k.label),
-                  };
+              let memory;
+              if (scope === 'user') {
+                memory = globalStoreFor();
+                if (!memory) return { ok: false, error: '用户级记忆库不可用（config.globalMemory 关着？）' };
+              } else {
+                if (!dir) {
+                  // ⚠ 只数**工作区库**：用户级库是另一个目标（由 scope 选），不算"歧义"
+                  const known = listKnownStores().filter((k) => k.kind !== 'user');
+                  if (known.length !== 1) {
+                    return {
+                      ok: false,
+                      error: `需要先指定记忆库（发现 ${known.length} 个工作区库，不允许猜）`,
+                      stores: known.map((k) => k.label),
+                    };
+                  }
                 }
+                memory = resolveRouteStore(dir);
               }
-              const memory = resolveRouteStore(dir);
               if (!memory) return { ok: false, error: '记忆库不可用' };
 
               const normalized = normalizeEntryInput(body);
@@ -763,6 +885,7 @@ export const apply = (ctx, rawConfig = {}) => {
                 return {
                   ok: true,
                   created: !id,
+                  scope,
                   entry: {
                     id: entry.id,
                     level: entry.level,
@@ -774,6 +897,41 @@ export const apply = (ctx, rawConfig = {}) => {
               } catch (error) {
                 return { ok: false, error: String(error?.message ?? error) };
               }
+            }),
+          }),
+          server.register({
+            kind: 'exact',
+            path: `${API_PREFIX}/persona`,
+            /**
+             * 读 / 写「人设设定」与「工作规范与行为准则」（V1.6）。
+             *
+             * 内容存在插件自己的目录里（`$DSH_HOME/memory-lite/persona/*.md`），
+             * **文件内容 = 文本框内容**：不解析、不加标记、不要求任何标题。
+             * （V1.5 那版写的是宿主的 AGENTS.md，还要求用户保留我加的 `### 标题` —— 已废弃。）
+             *
+             * 写之前先备份；带 mtime 的乐观并发：该槽位文件被别处改过就拒绝这次写入，
+             * 让人先刷新 —— 否则会把手改的内容覆盖掉。
+             */
+            handler: makeHandler(async (req) => {
+              const method = String(req?.method ?? 'GET').toUpperCase();
+              if (method !== 'POST') return readPersona(PERSONA_DIR);
+
+              const body = await readBody(req);
+              const slot = String(body?.slot ?? '');
+              const current = readPersona(PERSONA_DIR);
+              if (!current.ok) return current;
+              if (!Object.hasOwn(current.mtimes, slot)) return { ok: false, error: 'slot 必须是 persona 或 rules' };
+              if (body?.mtime !== undefined && Number(body.mtime) !== Number(current.mtimes[slot])) {
+                return {
+                  ok: false,
+                  error: '这个文件刚被别处改过（可能是你手工编辑，或另一个会话），请点「重新读取」再保存',
+                  mtimes: current.mtimes,
+                };
+              }
+              const out = writePersona(PERSONA_DIR, slot, String(body?.text ?? ''));
+              if (!out.ok) return out;
+              const fresh = readPersona(PERSONA_DIR);
+              return { ...out, mtimes: fresh.ok ? fresh.mtimes : null };
             }),
           }),
           server.register({

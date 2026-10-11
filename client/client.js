@@ -157,8 +157,11 @@ window.__ModuleLoader__.load({
       const [query, setQuery] = React.useState('');
       const [statusFilter, setStatusFilter] = React.useState('active');
       const [busy, setBusy] = React.useState('');
-      // V3.1 面板写入：editor=null 表示没在编辑；否则是表单的当前值
-      const [editor, setEditor] = React.useState(null);
+      // 人设 / 工作规范：读写的是**宿主全局指令文件**（AGENTS.md），不是记忆库 ——
+      // 因为它们必须每轮生效，而记忆库靠关键词召回（规范类"这轮没命中"就等于静默失效）
+      const [persona, setPersona] = React.useState(null);
+      const [draft, setDraft] = React.useState({ persona: '', rules: '' });
+      const [personaBusy, setPersonaBusy] = React.useState('');
 
       const reload = React.useCallback(async () => {
         try {
@@ -211,45 +214,51 @@ window.__ModuleLoader__.load({
         }
       };
 
-      // ── V3.1 面板写入：新增 / 编辑 ────────────────────────────────────────
-      // 写进哪个库由**当前的库选择器**决定（多库时它就在上面），服务端也要求显式给 dir，
-      // 不猜"哪个工作区在活跃" —— 那个坑 V2 踩过（面板读到 global 回退空库，显示 0 条）。
-      const openCreate = () => setEditor({
-        id: null, level: 'fact', content: '', title: '', keywords: '', importance: 3, project: '', subcategory: '',
-      });
-
-      const openEdit = (e) => setEditor({
-        id: e.id,
-        level: e.level,
-        content: e.content ?? '',
-        title: e.title ?? '',
-        keywords: (e.keywords ?? []).join(' '),
-        importance: e.importance ?? 1,
-        project: e.project ?? '',
-        subcategory: e.subcategory ?? '',
-      });
-
-      const doSave = async () => {
-        if (!editor) return;
-        if (!String(editor.content ?? '').trim()) {
-          setState((s) => ({ ...s, error: '内容不能为空', notice: null }));
-          return;
+      // ── 人设 / 工作规范：读写宿主 AGENTS.md（不是记忆库）──────────────────
+      // 为什么读文件：这两块必须**每轮生效**；记忆库靠关键词召回，
+      // 规范类的东西"这轮恰好没命中"就等于静默失效（详见 README 的说明）。
+      const loadPersona = React.useCallback(async () => {
+        try {
+          const data = await api('/persona');
+          setPersona(data);
+          if (data?.ok) setDraft({ persona: data.persona ?? '', rules: data.rules ?? '' });
+        } catch (error) {
+          setPersona({ ok: false, error: `读取失败：${String(error?.message ?? error)}（宿主路由 ${API}/persona 不可达）` });
         }
-        setBusy('save');
+      }, []);
+
+      React.useEffect(() => {
+        let alive = true;
+        (async () => {
+          if (alive) await loadPersona();
+        })();
+        return () => {
+          alive = false;
+        };
+      }, [loadPersona]);
+
+      const savePersona = async (slot) => {
+        setPersonaBusy(slot);
         setState((s) => ({ ...s, error: null, notice: null }));
         try {
-          const out = await api('/save', { ...editor, dir: currentDir });
+          // 带上打开面板时读到的 mtime：文件被别处改过时宿主会拒绝这次写入，
+          // 免得把用户手工编辑的内容悄悄覆盖掉。
+          const out = await api('/persona', { slot, text: draft[slot], mtime: persona?.mtimes?.[slot] });
           if (out?.ok === false) {
-            setState((s) => ({ ...s, error: String(out.error ?? '保存失败') }));
+            // ⚠ 这类报错最常见的成因不是"文件坏了"，而是**面板里装的是旧快照**
+            //   （面板打开之后宿主被重载过，或文件被别处改过）。所以先重读，
+            //   并在提示里说清"已经重读、直接再点一次" —— 否则用户只会反复点同一个按钮。
+            await loadPersona();
+            setState((s) => ({ ...s, error: `${String(out.error ?? '保存失败')}　→ 已自动重新读取文件内容（你在框里的改动已被丢弃，需重新编辑），请确认后直接再点一次保存。` }));
           } else {
-            setEditor(null);
-            await reload();
-            setState((s) => ({ ...s, notice: out?.created ? '已新增一条。' : '已保存修改。' }));
+            await loadPersona();
+            const label = slot === 'persona' ? '人设设定' : '工作规范与行为准则';
+            setState((s) => ({ ...s, notice: `${label} 已保存（备份 ${String(out.backup ?? '').split(/[\\/]/).pop()}）` }));
           }
         } catch (error) {
           setState((s) => ({ ...s, error: String(error?.message ?? error) }));
         } finally {
-          setBusy('');
+          setPersonaBusy('');
         }
       };
 
@@ -315,6 +324,57 @@ window.__ModuleLoader__.load({
       for (const e of entries) byLevel[e.level] = (byLevel[e.level] ?? 0) + 1;
 
       return h('div', { style: css.wrap }, [
+        // ── 人设 / 工作规范（读写宿主 AGENTS.md）──────────────────────────
+        h('div', { key: 'persona', style: css.card }, [
+          h('div', { key: 'h', style: css.meta }, [
+            h('strong', { key: 't' }, '人设与行为准则'),
+            h('span', { key: 'f' }, persona?.dir ? `存在插件自己的目录：${persona.dir}` : '每轮自动带进提示词（不依赖其它文件）'),
+          ]),
+          persona?.ok === false
+            ? h('div', { key: 'pe', style: { ...css.stat, color: 'var(--dsw-alias-text-error, #d33)' } }, `读不到：${persona.error}`)
+            : null,
+          h('div', { key: 'grid', style: { display: 'flex', flexDirection: 'column', gap: 10 } }, [
+            h('div', { key: 'p1', style: { display: 'flex', flexDirection: 'column', gap: 6 } }, [
+              h('div', { key: 'l', style: css.meta }, [
+                h('strong', { key: 'n' }, '人设设定'),
+                h('span', { key: 'd' }, '我是谁 / 什么语气 —— 每轮都会带上'),
+              ]),
+              h('textarea', {
+                key: 'ta',
+                style: { ...css.input, minHeight: 120, width: '100%', fontFamily: 'inherit', resize: 'vertical', lineHeight: 1.6 },
+                placeholder: '想写什么就写什么，没有任何格式要求（不用标题、不用 markdown）。',
+                value: draft.persona,
+                onChange: (e) => setDraft((d) => ({ ...d, persona: e.target.value })),
+                disabled: persona?.ok === false,
+              }),
+              h('div', { key: 'acts', style: css.row }, [
+                h('button', { key: 's', style: css.button, disabled: personaBusy !== '' || persona?.ok === false, onClick: () => savePersona('persona') },
+                  personaBusy === 'persona' ? '保存中…' : '保存人设'),
+                h('span', { key: 'hint', style: css.stat }, '保存时会先备份；文本框里写什么，文件里就是什么'),
+              ]),
+            ]),
+            h('div', { key: 'p2', style: { display: 'flex', flexDirection: 'column', gap: 6 } }, [
+              h('div', { key: 'l', style: css.meta }, [
+                h('strong', { key: 'n' }, '工作规范与行为准则'),
+                h('span', { key: 'd' }, '该怎么做 —— 每轮都会带上'),
+              ]),
+              h('textarea', {
+                key: 'ta',
+                style: { ...css.input, minHeight: 160, width: '100%', fontFamily: 'inherit', resize: 'vertical', lineHeight: 1.6 },
+                placeholder: '想写什么就写什么，没有任何格式要求。',
+                value: draft.rules,
+                onChange: (e) => setDraft((d) => ({ ...d, rules: e.target.value })),
+                disabled: persona?.ok === false,
+              }),
+              h('div', { key: 'acts', style: css.row }, [
+                h('button', { key: 's', style: css.button, disabled: personaBusy !== '' || persona?.ok === false, onClick: () => savePersona('rules') },
+                  personaBusy === 'rules' ? '保存中…' : '保存规范'),
+                h('button', { key: 'r', style: css.button, disabled: personaBusy !== '', onClick: loadPersona }, '重新读取'),
+                h('span', { key: 'hint', style: css.stat }, '保存后下一轮立刻生效，不用重启'),
+              ]),
+            ]),
+          ]),
+        ]),
         // 库选择器：只在发现多个库时出现。不猜"哪个工作区在活跃"——列出来让你选。
         state.stores.length > 1
           ? h('div', { key: 'stores', style: css.row }, [
@@ -324,7 +384,9 @@ window.__ModuleLoader__.load({
                 value: String(state.active),
                 onChange: (e) => setState((s) => ({ ...s, active: Number(e.target.value) })),
               }, state.stores.map((s, i) => h('option', { key: `st${i}`, value: String(i) },
-                `${s.workspace || s.label}（${(s.entries ?? []).length} 条）`))),
+                // V1.7：用户级库（workspace=null）显示它的 label —— 「用户级（跨工作区）」。
+                // 以后加别的非工作区库也在 label 里说明，别落下纯目录名。
+                `${s.kind === 'user' ? s.label : (s.workspace || s.label)}（${(s.entries ?? []).length} 条）`))),
             ])
           : null,
         h('div', { key: 'stats', style: css.stat },
@@ -352,13 +414,6 @@ window.__ModuleLoader__.load({
           ]),
           h('button', { key: 'r', style: css.button, onClick: reload, disabled: state.loading || busy !== '' }, '刷新'),
           h('button', {
-            key: 'n',
-            style: css.button,
-            disabled: busy !== '' || !currentStore,
-            title: '手动新增一条记忆。它写进的是当前选中的库（面板上方的库选择器，只有一个库时就是它）。',
-            onClick: openCreate,
-          }, '＋ 新增'),
-          h('button', {
             key: 'd',
             style: css.button,
             disabled: busy !== '',
@@ -377,143 +432,42 @@ window.__ModuleLoader__.load({
         !(state.error ?? state.snapshotError) && state.notice
           ? h('div', { key: 'notice', style: { ...css.stat, color: 'var(--dsw-alias-text-secondary, inherit)' } }, state.notice)
           : null,
-        // V3.1 编辑表单：就地展开，不用弹窗（弹窗在这种设置页里容易被遮罩/层级坑住）
-        editor
-          ? h('div', { key: 'editor', style: css.card }, [
-              h('div', { key: 'h', style: css.meta },
-                editor.id ? `编辑这条（id=${editor.id}）` : '新增一条记忆'),
-              h('div', { key: 'r1', style: css.row }, [
-                h('select', {
-                  key: 'lv',
-                  style: { ...css.input, flex: '0 0 auto', minWidth: 140 },
-                  value: editor.level,
-                  onChange: (e) => setEditor((v) => ({ ...v, level: e.target.value })),
-                }, Object.keys(LEVEL_LABEL).map((lv) => h('option', { key: lv, value: lv }, LEVEL_LABEL[lv]))),
-                h('input', {
-                  key: 'ti',
-                  style: css.input,
-                  placeholder: '标题（可留空；索引里会退回正文前 20 字）',
-                  value: editor.title,
-                  onChange: (e) => setEditor((v) => ({ ...v, title: e.target.value })),
-                }),
-                h('select', {
-                  key: 'im',
-                  style: { ...css.input, flex: '0 0 auto', minWidth: 120 },
-                  value: String(editor.importance),
-                  onChange: (e) => setEditor((v) => ({ ...v, importance: Number(e.target.value) })),
-                }, [4, 3, 2, 1].map((n) => h('option', { key: `i${n}`, value: String(n) },
-                  `重要性 ${n}${n >= 3 ? '（压缩后会被补回）' : ''}`))),
-              ]),
-              h('textarea', {
-                key: 'ct',
-                style: { ...css.input, minHeight: 88, width: '100%', fontFamily: 'inherit', resize: 'vertical' },
-                placeholder: '内容（必填）。写成"下次新会话仍然需要知道"的样子；用户的原话请原样保留。',
-                value: editor.content,
-                onChange: (e) => setEditor((v) => ({ ...v, content: e.target.value })),
-              }),
-              h('div', { key: 'r2', style: css.row }, [
-                h('input', {
-                  key: 'kw',
-                  style: css.input,
-                  placeholder: '关键词（空格或逗号分隔，可留空）',
-                  value: editor.keywords,
-                  onChange: (e) => setEditor((v) => ({ ...v, keywords: e.target.value })),
-                }),
-                editor.level === 'project'
-                  ? h('input', {
-                      key: 'pj',
-                      style: css.input,
-                      placeholder: '项目名（选「项目」时必填）',
-                      value: editor.project,
-                      onChange: (e) => setEditor((v) => ({ ...v, project: e.target.value })),
-                    })
-                  : null,
-                editor.level === 'project'
-                  ? h('select', {
-                      key: 'sc',
-                      style: { ...css.input, flex: '0 0 auto', minWidth: 130 },
-                      value: editor.subcategory ?? '',
-                      onChange: (e) => setEditor((v) => ({ ...v, subcategory: e.target.value })),
-                    }, [['', '不分子类'], ['overview', '概览'], ['structure', '结构'], ['decisions', '决策'],
-                        ['quotes', '原话'], ['ops', '运维'], ['todo', '待办']]
-                      .map(([v, label]) => h('option', { key: v || 'none', value: v }, label)))
-                  : null,
-              ].filter(Boolean)),
-              h('div', { key: 'acts', style: css.row }, [
-                h('button', { key: 'sv', style: css.button, disabled: busy !== '', onClick: doSave },
-                  busy === 'save' ? '保存中…' : '保存'),
-                h('button', { key: 'cx', style: css.button, disabled: busy !== '', onClick: () => setEditor(null) }, '取消'),
-                h('span', { key: 'hint', style: css.stat },
-                  '保存后立刻生效（索引段与检索都会读到它），不用重启；含凭据类内容会被自动标记为敏感、不参与注入。'),
-              ]),
-            ])
-          : null,
         state.loading
           ? h('div', { key: 'load', style: css.stat }, '读取中…')
           : h('div', { key: 'list', style: css.list }, shown.length
-            ? shown.map((e) => h('div', { key: e.id, style: css.card }, [
-                h('div', { key: 'm', style: css.meta }, [
-                  h('strong', { key: 'l' }, LEVEL_LABEL[e.level] ?? e.level),
-                  e.project ? h(Tag, { key: 'p' }, e.project) : null,
-                  e.subcategory ? h(Tag, { key: 'c' }, e.subcategory) : null,
-                  h(Tag, { key: 'st' }, STATUS_LABEL[e.status] ?? e.status),
-                  h('span', { key: 'i' }, `重要性 ${e.importance}`),
-                  // V2-1 注入可见性：让"记忆到底有没有在工作"一眼可见
-                  h('span', {
-                    key: 'used',
-                    title: '这条记忆被自动注入进对话的次数（括号内是最近一次的时间）',
-                  }, e.injectCount ? `用过 ${e.injectCount} 次${e.lastInjectedAt ? `（${fmtTime(e.lastInjectedAt)}）` : ''}` : '还没被用过'),
-                  e.sensitive ? h(Tag, { key: 'se', warn: true }, '敏感·不注入') : null,
-                  h('span', { key: 't' }, fmtTime(e.updatedAt)),
-                ].filter(Boolean)),
-                h('div', { key: 'b', style: css.body }, String(e.content ?? '').slice(0, 600)),
-                e.keywords?.length
-                  ? h('div', { key: 'k', style: css.meta }, e.keywords.slice(0, 13).map((k, i) => h(Tag, { key: `k${i}` }, k)))
-                  : null,
-                h('div', { key: 'a', style: css.row }, [
-                  h('button', {
-                    key: 'ed',
-                    style: css.button,
-                    disabled: busy !== '',
-                    title: '编辑这条的内容 / 关键词 / 层级 / 重要性',
-                    onClick: () => openEdit(e),
-                  }, '编辑'),
-                  e.status !== 'archived'
-                    ? h('button', {
-                        key: 'ar',
-                        style: css.button,
-                        disabled: busy !== '',
-                        title: '这条不再正确或不再需要（过时、被取代、写错了）→ 不再被注入，但仍可搜到、可恢复',
-                        onClick: () => doSetStatus(e.id, 'archived'),
-                      }, '不再使用')
-                    : h('button', {
-                        key: 'un',
-                        style: css.button,
-                        disabled: busy !== '',
-                        title: '重新启用这条记忆（回到「在用」）',
-                        onClick: () => doSetStatus(e.id, 'active'),
-                      }, '恢复使用'),
-                  e.status === 'active'
-                    ? h('button', {
-                        key: 'st2',
-                        style: css.button,
-                        disabled: busy !== '',
-                        title: '这件事已经做完了（todo 完成 / 话题达成目标）→ 内容仍然有效、仍可被搜到与召回，只是标记为已结束',
-                        onClick: () => doSetStatus(e.id, 'stale'),
-                      }, '已完成')
-                    : null,
-                  e.status === 'stale'
-                    ? h('button', {
-                        key: 're2',
-                        style: css.button,
-                        disabled: busy !== '',
-                        title: '改回「在用」（例如这件事又需要继续跟进）',
-                        onClick: () => doSetStatus(e.id, 'active'),
-                      }, '重新进行')
-                    : null,
-                  h('span', { key: 'id', style: { ...css.meta, fontSize: 11 } }, e.id),
-                ].filter(Boolean)),
-              ]))
+            // 一行一条：层级 · 标题 · 状态 · 用过几次 + 状态操作。
+            // 正文**不在前端展示**（用户 2026-10-12 的决定）：35 条摊开正文太冗余；
+            // 想看全文可以问我，或者直接开库文件。
+            ? shown.map((e) => h('div', {
+                key: e.id,
+                style: { ...css.card, flexDirection: 'row', alignItems: 'center', gap: 8, padding: '5px 10px' },
+              }, [
+                h(Tag, { key: 'l' }, LEVEL_LABEL[e.level] ?? e.level),
+                e.project ? h(Tag, { key: 'p' }, e.project) : null,
+                h('span', {
+                  key: 't',
+                  title: e.title ? String(e.title) : String(e.content ?? '').slice(0, 120),
+                  style: { fontSize: 13, flex: '1 1 auto', overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' },
+                }, e.title || String(e.content ?? '').replace(/\s+/g, ' ').slice(0, 24) || '(无标题)'),
+                e.sensitive ? h(Tag, { key: 'se', warn: true }, '敏感') : null,
+                h('span', {
+                  key: 'used',
+                  style: { ...css.stat, flex: '0 0 auto' },
+                  title: '这条记忆被自动注入进对话的次数',
+                }, e.injectCount ? `用过 ${e.injectCount} 次` : '未用过'),
+                h('select', {
+                  key: 'st',
+                  style: { ...css.input, flex: '0 0 auto', minWidth: 92, padding: '2px 6px', fontSize: 12 },
+                  value: e.status,
+                  disabled: busy !== '',
+                  title: '在用 = 有效且可能被召回；已完成 = 这件事做完了（内容仍有效）；已停用 = 不再被注入，但仍可搜到、可恢复',
+                  onChange: (ev) => doSetStatus(e.id, ev.target.value),
+                }, [
+                  h('option', { key: 'a', value: 'active' }, '在用'),
+                  h('option', { key: 's', value: 'stale' }, '已完成'),
+                  h('option', { key: 'x', value: 'archived' }, '已停用'),
+                ]),
+              ].filter(Boolean)))
             : h('div', { key: 'empty', style: css.stat }, '没有符合条件的记忆。')),
       ]);
     }

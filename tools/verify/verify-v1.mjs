@@ -11,13 +11,13 @@
  *
  * 用法: node verify-v1.mjs
  */
-import { mkdtempSync, rmSync } from 'node:fs';
+import { existsSync, mkdtempSync, mkdirSync, readFileSync, readdirSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
-import { join } from 'node:path';
+import { dirname, join } from 'node:path';
 import { pathToFileURL } from 'node:url';
 
 import { renderIndexSection, renderRecallBlock, renderRecoveryBlock } from '../../lib/prompt.js';
-import { createInjectState, createInjectedMessage, isOwnInjection, stripOwnInjections, lastUserText, pickForInjection, SOURCE_KIND } from '../../lib/inject.js';
+import { createInjectState, createInjectedMessage, isOwnInjection, stripOwnInjections, lastUserText, pickForInjection, mergeRecallCandidates, SOURCE_KIND } from '../../lib/inject.js';
 import { buildTools, DESTRUCTIVE_TOOLS } from '../../lib/tools.js';
 import { captureTurn, extractTurnText } from '../../lib/capture.js';
 import { openMemory } from '../../lib/storage.js';
@@ -479,7 +479,9 @@ console.log('=== verify-v1 ===\n');
       },
     },
     systemPrompt: {
-      getSectionOrder: () => 4000,
+      // 按 key 返回真值（照抄框架 SECTION_ORDERS 里那两个值）——
+      // 全都返回同一个数的话，"人设段是否紧跟框架人设段"这条断言就测不出来。
+      getSectionOrder: (key) => ({ DEPLOYMENT_PERSONA_PREFIX: 0, TOOLS_SDK: 5000 }[key] ?? 4000),
       section(def) {
         registered.push({ __section: true, name: def.name, order: def.order, interpolate: def.interpolate, text: def.text });
         return () => disposed.push(`section:${def.name}`);
@@ -529,6 +531,24 @@ console.log('=== verify-v1 ===\n');
     (handlers.get(evt)?.length ?? 0) > 0
       ? ok(`接线：注册了 ${evt}`, `${handlers.get(evt).length} 个处理函数`)
       : bad(`接线：注册了 ${evt}`);
+  }
+
+  // ── V1.6：人设段注册（注入 system prompt，紧跟框架自己的人设段）──────────
+  // 第一版把这两块写进用户的 AGENTS.md 并要求保留我加的 `### 标题` —— 用户原话
+  // 「不合理」。现在改成：内容在插件自己的文件里，靠 systemPrompt 段落"每轮必到"。
+  {
+    const personaSec = registered.find((r) => r.__section && r.name === 'memory-lite:persona');
+    personaSec ? ok('接线：注册了人设段 memory-lite:persona') : bad('接线：注册了人设段', registered.filter((r) => r.__section).map((r) => r.name).join(','));
+    personaSec?.order === 1
+      ? ok('人设段位置：紧跟框架的人设前缀（0 → 1）', `order=${personaSec.order}`)
+      : bad('人设段位置', `order=${personaSec?.order}（期望 1）`);
+    personaSec?.interpolate === false
+      ? ok('人设段声明了 interpolate:false（正文里的 {{ }} 不会炸）')
+      : bad('人设段 interpolate', String(personaSec?.interpolate));
+    const idxSec = registered.find((r) => r.__section && r.name === 'memory-lite:index');
+    idxSec?.order === 5000 && personaSec?.order < idxSec?.order
+      ? ok('两个段落的位置关系正确：人设（1）在记忆索引（5000）之前')
+      : bad('段落位置关系', `persona=${personaSec?.order} index=${idxSec?.order}`);
   }
 
   // ── V3.1：面板写入路由（/save）────────────────────────────────────────
@@ -639,7 +659,129 @@ console.log('=== verify-v1 ===\n');
       : bad('召回：注入内容来自命中的记忆', JSON.stringify(injected[0]?.content)?.slice(0, 120));
   }
 
-  // V3-3 召回观测：**0 命中也必须落一行** —— 那正是"换个说法就搜不到"的直接证据
+  // ── V1.7：用户级（跨工作区）记忆库 ───────────────────────────────────────
+  // 这一块测的是新增的那条链：**写进用户级库 → 在另一个工作区的召回里被取到**。
+  // 它是"用户级长期记忆跨工作区生效"这个承诺的唯一证据，所以每一步都用真实路径
+  // （真工具 execute + 真 pre-step handler + 真库文件），不 mock。
+  {
+    const userMarker = '跨工作区探针词';
+    const noteTool = registered.find((r) => r.name === 'memory_note');
+    noteTool ? ok('接线：memory_note 可用（下面用它演练真实写入）') : bad('接线：memory_note');
+    const agentA = { session: { id: 'w-user', header: { cwd: root } } };
+    const wrote = await noteTool.execute({
+      content: `用户级记忆探针：这条应当跨工作区生效（${userMarker}）。`,
+      keywords: [userMarker, '用户级', '跨工作区', '画像'],
+      importance: 4,
+      level: 'user',
+      project: '全局',
+      scope: 'user',
+      title: '用户级记忆探针',
+    }, agentA);
+    /已写入|写入/.test(String(wrote)) ? ok('写入：memory_note(scope="user") 成功', String(wrote).slice(0, 40)) : bad('写入：memory_note(scope="user")', String(wrote).slice(0, 120));
+
+    // 用户级库的文件确实出现在 $DSH_HOME/memory-lite/global 下
+    const globalDb = join(root, '.dsh-home', 'memory-lite', 'global', 'memory.db');
+    existsSync(globalDb) ? ok('写入：落在 $DSH_HOME/memory-lite/global', `db=${globalDb.replace(root, '')}`) : bad('写入：没落进用户级库');
+    if (existsSync(globalDb)) {
+      const gconn = new DatabaseSync(globalDb, { readOnly: true });
+      const n = gconn.prepare('SELECT COUNT(*) AS n FROM entries').get().n;
+      const ws = gconn.prepare("SELECT value FROM meta WHERE key='workspace'").get()?.value ?? null;
+      gconn.close();
+      n === 1 ? ok('写入：用户级库里正好 1 条（没串进工作区库）') : bad('写入：用户级库条数', `n=${n}`);
+      ws === null ? ok('写入：用户级库的 workspace 为 null（不是某个项目）') : bad('写入：用户级库 workspace', String(ws));
+    }
+
+    // 工作区 A 的库里不该有这条（scope 是显式的，不是"两边都写一份"）
+    const wsAdb = join(root, '.dsh-memory-test', 'memory.db');
+    if (existsSync(wsAdb)) {
+      const aconn = new DatabaseSync(wsAdb, { readOnly: true });
+      const dup = aconn.prepare("SELECT COUNT(*) AS n FROM entries WHERE content LIKE '%跨工作区探针词%'").get().n;
+      aconn.close();
+      dup === 0 ? ok('写入：**只**写进了用户级库，工作区库没被顺带写入') : bad('写入：工作区库被顺带写入', `n=${dup}`);
+    }
+
+    // ★ 关键：在**另一个工作区**开一个会话，召回必须取到那条用户级记忆
+    const wsB = join(root, 'ws-b');
+    mkdirSync(wsB, { recursive: true });
+    const claimedB = [{ role: 'user', content: [{ type: 'text', text: '问一个跨工作区探针词的问题' }], source: { kind: 'user' } }];
+    const payloadB = { agent: { session: { id: 'w-b', header: { cwd: wsB } } }, messages: claimedB, step: 1, turn: 1 };
+    const outB = await runPreStep(payloadB, { kind: 'enter', messages: [...claimedB] });
+    const injectedB = (outB?.messages ?? []).filter((m) => m?.source?.kind === SOURCE_KIND);
+    const injectedText = injectedB.map((m) => String(m?.content?.[0]?.text ?? '')).join('\n');
+    injectedB.length >= 1 ? ok('跨工作区召回：在另一个工作区命中了注入', `注入 ${injectedB.length} 条`) : bad('跨工作区召回：另一个工作区没命中', `消息数 ${outB?.messages?.length}`);
+    injectedText.includes(userMarker)
+      ? ok('跨工作区召回：注入内容来自**用户级库**那条')
+      : bad('跨工作区召回：内容对不上', injectedText.slice(0, 160));
+    // 工作区 B 自己的库是空的 —— 所以这条只可能来自用户级库（排除"其实是本地库命中"）
+    const bdb = join(wsB, '.dsh-memory-test', 'memory.db');
+    const bCount = existsSync(bdb)
+      ? (() => { const c = new DatabaseSync(bdb, { readOnly: true }); const v = c.prepare('SELECT COUNT(*) AS n FROM entries').get().n; c.close(); return v; })()
+      : 0;
+    bCount === 0 ? ok('跨工作区召回：工作区 B 自己的库是空的（结论无歧义）') : bad('跨工作区召回：B 库非空', `n=${bCount}`);
+
+    // 计数落在条目自己的库：用户级库的 inject_count 应当是 1
+    if (existsSync(globalDb)) {
+      const gconn2 = new DatabaseSync(globalDb, { readOnly: true });
+      const ic = gconn2.prepare('SELECT inject_count AS n FROM entries LIMIT 1').get()?.n ?? 0;
+      gconn2.close();
+      ic >= 1 ? ok('记账：用户级条目的 inject_count 落在它自己的库里', `n=${ic}`) : bad('记账：用户级条目计数', `n=${ic}`);
+    }
+
+    // 索引段**不含**用户级条目（这是与用户确认过的取舍：4096 B 留给工作区条目）
+    const idxSection = registered.find((r) => r.__section && r.name === 'memory-lite:index');
+    let idxText = '';
+    try {
+      idxText = String(idxSection?.text?.({ agent: { session: { header: { cwd: root } } } }) ?? '');
+    } catch (error) {
+      idxText = `__THREW__${String(error?.message ?? error)}`;
+    }
+    !idxText.includes(userMarker) && !idxText.startsWith('__THREW__')
+      ? ok('索引段：**不含**用户级条目（按确认过的取舍，容量留给工作区）')
+      : bad('索引段：混进了用户级条目', idxText.slice(0, 160));
+
+    // 面板快照：用户级库要能被看到，并标成 kind=user
+    const snapRoute = routes.find((r) => String(r.path).endsWith('/snapshot'));
+    let snap = null;
+    {
+      const res = { writeHead: () => {}, end: (s) => { try { snap = JSON.parse(s); } catch { snap = null; } } };
+      await snapRoute.handler({ url: '/dsh-memory-lite/api/snapshot' }, res);
+    }
+    const userStore = (snap?.stores ?? []).find((s) => s.kind === 'user');
+    userStore ? ok('面板快照：列出了用户级库（kind=user）', userStore.label) : bad('面板快照：没有用户级库', JSON.stringify((snap?.stores ?? []).map((s) => s.label)));
+    (userStore?.entries ?? []).some((e) => String(e.content ?? '').includes(userMarker))
+      ? ok('面板快照：用户级库里能看到刚写的那条')
+      : bad('面板快照：用户级库内容', JSON.stringify((userStore?.entries ?? []).length));
+
+    // /save 的 scope 分支
+    const saveRouteUser = routes.find((r) => String(r.path).endsWith('/save'));
+    let saved = null;
+    {
+      const res = { writeHead: () => {}, end: (s) => { try { saved = JSON.parse(s); } catch { saved = null; } } };
+      await saveRouteUser.handler({
+        url: '/dsh-memory-lite/api/save',
+        body: { content: `面板写入的用户级探针 ${userMarker}`, scope: 'user', importance: 2 },
+      }, res);
+    }
+    saved?.ok === true && saved?.scope === 'user'
+      ? ok('路由 /save：scope="user" 写进用户级库（不需要 dir）')
+      : bad('路由 /save：scope="user"', JSON.stringify(saved)?.slice(0, 140));
+
+    // 纯函数：合并候选的三条规则
+    const mk = (id, score, content, title) => ({ id, score, content, title, level: 'fact' });
+    const fakeA = { search: () => [mk('a1', 5, '内容甲'), mk('a2', 9, '内容乙')] };
+    const fakeB = { search: () => [mk('b1', 5, '内容甲'), mk('b2', 99, '内容丙')] };
+    const merged = mergeRecallCandidates([{ memory: fakeA, tag: 'workspace' }, { memory: fakeB, tag: 'user' }], 'x');
+    merged.length === 3 ? ok('合并：同内容不同 id 只留一条（用内容指纹判重）', `合并后 ${merged.length} 条`) : bad('合并：判重', `len=${merged.length} ids=${merged.map((m) => m.id)}`);
+    merged[0]?.id === 'b2' ? ok('合并：按分数降序（99 排第一）') : bad('合并：排序', JSON.stringify(merged.map((m) => [m.id, m.score])));
+    const tie = mergeRecallCandidates([{ memory: fakeA, tag: 'workspace' }, { memory: { search: () => [mk('b9', 5, '内容丁')] }, tag: 'user' }], 'x');
+    tie[0]?._scope === 'workspace' ? ok('合并：同分时工作区库优先（更具体）') : bad('合并：同分优先级', JSON.stringify(tie.map((m) => [m.id, m._scope])));
+    mergeRecallCandidates([{ memory: { search: () => { throw new Error('库坏了'); } }, tag: 'user' }, { memory: fakeA, tag: 'workspace' }], 'x').length === 2
+      ? ok('合并：某个库搜不动时跳过它，不影响另一个库')
+      : bad('合并：单库异常');
+    mergeRecallCandidates([], 'x').length === 0 ? ok('合并：没有库时返回空数组') : bad('合并：空输入');
+  }
+
+
   try {
     const conn = new DatabaseSync(join(root, '.dsh-memory-test', 'memory.db'), { readOnly: true });
     const rows = conn.prepare('SELECT query_text, segments, hits, picked FROM recall_runs ORDER BY id DESC').all();
@@ -685,16 +827,116 @@ console.log('=== verify-v1 ===\n');
   }
 
   // 不带 dir 的分支放在**这里**测：前面跑过 pre-step 之后，工作区库才被 storeFor 登记进
-  // 注册表（"只有一个已知库"这个前提才成立）。放在前面测会变成"没有已知库 → 被守卫拒"，
-  // 那断言就成了必然通过的空话。
+  // 注册表。放在前面测会变成"没有已知库 → 被守卫拒"，那断言就成了必然通过的空话。
+  //
+  // ⚠ V1.7 起这个块跑的时候**已经有两个工作区库**（跨工作区测试造了 `ws-b`），
+  //   所以"不带 dir 就落到唯一那个库"这个前提不再成立 —— 现在正确的行为是**拒绝**。
+  //   两条都测：多库不带 dir → 拒；带 dir → 落到指定的那个库。
   {
     const saveRoute = routes.find((r) => String(r.path).endsWith('/save'));
     let payload = null;
     const res = { writeHead: () => {}, end: (s) => { try { payload = JSON.parse(s); } catch { payload = null; } } };
-    await saveRoute.handler({ url: '/dsh-memory-lite/api/save', body: { content: '不带 dir 的写入：应当落到唯一已知的工作区库' } }, res);
-    payload?.ok === true
-      ? ok('面板保存：不带 dir 时落到唯一的已知库', `created=${payload.created}`)
-      : bad('面板保存：不带 dir', JSON.stringify(payload));
+    await saveRoute.handler({ url: '/dsh-memory-lite/api/save', body: { content: '不带 dir 的写入' } }, res);
+    payload?.ok === false && /需要先指定记忆库/.test(String(payload.error))
+      ? ok('面板保存：多个工作区库 + 不带 dir → 拒绝（不猜，让调用方显式指定）', `${(payload.stores ?? []).length} 个库`)
+      : bad('面板保存：多库不带 dir 应被拒', JSON.stringify(payload)?.slice(0, 140));
+
+    let payload2 = null;
+    const res2 = { writeHead: () => {}, end: (s) => { try { payload2 = JSON.parse(s); } catch { payload2 = null; } } };
+    await saveRoute.handler({ url: '/dsh-memory-lite/api/save', body: { content: '带 dir 的写入：应当落到指定的工作区库', dir: join(root, '.dsh-memory-test') } }, res2);
+    payload2?.ok === true && payload2?.scope === 'workspace'
+      ? ok('面板保存：带 dir → 落到指定的那个工作区库', `created=${payload2.created}`)
+      : bad('面板保存：带 dir', JSON.stringify(payload2)?.slice(0, 140));
+  }
+
+  // ── V1.5：人设 / 工作规范（读写宿主 AGENTS.md）────────────────────────
+  // 这块会**改宿主的全局指令文件**（影响所有工作区），所以断言的重点不是"能写"，
+  // 而是"**只动该动的那几节，其余字节一个不改**"，以及"结构不对就拒写"。
+  {
+    const { readPersona, writePersona, renderPersonaSection } = await import(
+      pathToFileURL(join(process.cwd(), 'lib', 'persona.js')).href
+    );
+    const dir = join(root, '.dsh-home', 'memory-lite', 'persona');
+    mkdirSync(dir, { recursive: true });
+
+    // 目录还不存在时也要能读（返回空串，不是报错）
+    const empty = readPersona(join(root, '.dsh-home', 'memory-lite', 'not-yet'));
+    empty.ok && empty.persona === '' && empty.rules === ''
+      ? ok('读取：目录/文件不存在时返回空串（不报错）')
+      : bad('读取：空目录', JSON.stringify(empty));
+
+    // ★ 这条是这次返工的核心：**文本框里写什么，文件里就是什么** ——
+    //   不带任何格式要求，连一个 `#` 都没有也必须原样存下（用户上一版被"### 标题不能删"卡住过）。
+    const plain = '我是你的长期助手。\n冷静、直接、务实。\n\n不要客套，先给结论。';
+    const w1 = writePersona(dir, 'persona', plain);
+    const onDisk = readFileSync(join(dir, 'persona.md'), 'utf8');
+    w1.ok && onDisk === plain
+      ? ok('写回：正文**逐字节原样**落盘（没有任何标题要求）', `${onDisk.length} 字`)
+      : bad('写回：原样落盘', `ok=${w1.ok} same=${onDisk === plain}`);
+    !onDisk.includes('#') ? ok('写回：没有偷偷加任何 markdown 标题') : bad('写回：被加了标题', onDisk.slice(0, 40));
+
+    // 换行、空行、特殊字符都原样保留
+    const tricky = 'A\r\nB\n\n\nC\tD  \n中文、标点。';
+    writePersona(dir, 'rules', tricky);
+    readFileSync(join(dir, 'rules.md'), 'utf8') === tricky
+      ? ok('写回：换行/空行/制表符/尾部空格原样保留')
+      : bad('写回：特殊字符', JSON.stringify(readFileSync(join(dir, 'rules.md'), 'utf8')));
+
+    const read1 = readPersona(dir);
+    read1.ok && read1.persona === plain && read1.rules === tricky
+      ? ok('读取：两个槽位读回的与写入的完全一致')
+      : bad('读取：往返', JSON.stringify([read1.persona === plain, read1.rules === tricky]));
+
+    // 备份落在 backup/ 子目录，不跟正文混在一起。
+    // ⚠ 第一次写文件时它还不存在 → 不会产生备份；所以要**再写一次**才看得到备份
+    //   （第一版断言直接 readdir 备份目录，文件不存在时整个校验器崩了）。
+    const beforeCount = existsSync(join(dir, 'backup')) ? readdirSync(join(dir, 'backup')).length : 0;
+    writePersona(dir, 'persona', `${plain}\n（第二次写入，用来触发备份）`);
+    const afterList = existsSync(join(dir, 'backup')) ? readdirSync(join(dir, 'backup')) : [];
+    afterList.length === beforeCount + 1
+      ? ok('写回：覆盖已有文件时生成备份（放在 backup/ 子目录）', afterList[afterList.length - 1])
+      : bad('写回：备份', `before=${beforeCount} after=${afterList.length}`);
+
+    // 段落渲染：都空 → ''（调用方据此不注入）；只有一份 → 只出现那一份
+    renderPersonaSection({ persona: '', rules: '' }) === ''
+      ? ok('段落渲染：两份都空 → 返回空串（不注入空段落）')
+      : bad('段落渲染：空输入');
+    const onlyP = renderPersonaSection({ persona: '甲', rules: '' });
+    onlyP.includes('人设设定') && onlyP.includes('甲') && !onlyP.includes('工作规范与行为准则')
+      ? ok('段落渲染：只有人设时，只渲染人设')
+      : bad('段落渲染：只有人设', onlyP);
+    const both = renderPersonaSection({ persona: '甲', rules: '乙' });
+    both.indexOf('甲') < both.indexOf('乙') ? ok('段落渲染：人设在前、规范在后') : bad('段落渲染：顺序', both);
+
+    // 路由（真实 handler）
+    const personaRoute = routes.find((r) => String(r.path).endsWith('/persona'));
+    personaRoute ? ok('接线：注册了 /persona 路由') : bad('接线：注册了 /persona 路由');
+    const callRoute = async (method, body) => {
+      let payload = null;
+      const res = { writeHead: () => {}, end: (s) => { try { payload = JSON.parse(s); } catch { payload = null; } } };
+      await personaRoute.handler({ url: '/dsh-memory-lite/api/persona', method, body }, res);
+      return payload;
+    };
+    // ⚠ 别拿更早的 `plain` 比对：中间我们已经把 persona.md 覆盖过一次（为了触发备份）。
+    //   拿"当前磁盘内容"比才对（第一版就是拿旧值比，报了一条假红）。
+    const got = await callRoute('GET');
+    const onDiskNow = readFileSync(join(dir, 'persona.md'), 'utf8');
+    got?.ok === true && String(got.persona ?? '') === onDiskNow && typeof got.mtimes?.rules === 'number'
+      ? ok('路由 GET /persona：返回两个槽位与各自 mtime')
+      : bad('路由 GET /persona', JSON.stringify(got)?.slice(0, 120));
+
+    const stale = await callRoute('POST', { slot: 'rules', text: '偷改', mtime: 1 });
+    stale?.ok === false && String(stale.error ?? '').includes('改过')
+      ? ok('路由 POST /persona：mtime 不一致时拒绝写入（防覆盖手改）')
+      : bad('路由 POST /persona：mtime 冲突', JSON.stringify(stale)?.slice(0, 160));
+
+    const badSlot = await callRoute('POST', { slot: '不存在', text: 'x' });
+    badSlot?.ok === false ? ok('路由 POST /persona：非法 slot 被拒', String(badSlot.error)) : bad('路由 POST /persona：非法 slot', JSON.stringify(badSlot));
+
+    const okWrite = await callRoute('POST', { slot: 'rules', text: '新规范（路由）', mtime: got.mtimes?.rules });
+    readPersona(dir).rules === '新规范（路由）' && okWrite?.ok === true
+      ? ok('路由 POST /persona：正常写入生效')
+      : bad('路由 POST /persona：正常写入', JSON.stringify(okWrite)?.slice(0, 160));
   }
 
   // 释放

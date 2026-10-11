@@ -50,9 +50,14 @@ uiImports.length === 0
   missing.length === 0
     ? ok('两端契约：客户端调的每个路径都有对应路由', `客户端 ${called.join(', ')} · 服务端 ${registered.join(', ')}`)
     : bad('两端契约：有客户端调用却没有路由', missing.join(', '));
-  called.includes('/save')
-    ? ok('客户端已接上 /save（面板新增/编辑）')
-    : bad('客户端已接上 /save（面板新增/编辑）', called.join(', '));
+  called.includes('/persona')
+    ? ok('客户端已接上 /persona（人设 / 工作规范两个文本框）', called.join(', '))
+    : bad('客户端已接上 /persona', called.join(', '));
+  // V1.5 起面板不再提供"新增/编辑单条记忆"（改成两个大文本框管设定）。
+  // 断言"不再调用"是为了防"前端已删、后端还留着入口"这种误会 —— 路由本身保留且有断言。
+  !called.includes('/save')
+    ? ok('客户端不再调用 /save（面板写入已移除；路由保留但前端不暴露）')
+    : bad('客户端仍在调用 /save', called.join(', '));
 }
 
 // ── 造一个假运行环境 ─────────────────────────────────────────────────────

@@ -143,9 +143,24 @@ try {
   onlyA.includes('没有检索到') ? ok('默认只搜当前工作区（搜不到别的库）', onlyA.slice(0, 40)) : bad('默认只搜当前工作区', onlyA.slice(0, 80));
 
   const allWs = await search.execute({ query: '跨库检索', scope: 'all' }, exec);
-  allWs.includes(b1.id) && allWs.includes('工作区: D:\\WS-B')
-    ? ok('scope=all 跨库命中并标注来源工作区')
-    : bad('scope=all 跨库命中并标注来源工作区', allWs.slice(0, 160));
+  // V1.7：措辞从「工作区」改成「库」（因为跨库现在也包含用户级库那一份），
+  // 所以这里跟着改 —— 断言的是"标注了来源"，不是具体那个词。
+  allWs.includes(b1.id) && allWs.includes('来自: D:\\WS-B')
+    ? ok('scope=all 跨库命中并标注来源')
+    : bad('scope=all 跨库命中并标注来源', allWs.slice(0, 160));
+
+  // V1.7：scope="user" 只搜用户级库（fallbackMemory 指哪就搜哪）
+  {
+    const U = openMemory({ dir: join(root, 'user-store'), workspace: null, archiveDir: join(root, 'user-store', 'archive') });
+    const u1 = U.put({ level: 'user', content: '用户级库里的画像：跨库唯一能找到', keywords: ['画像探针'], importance: 3, project: '全局' });
+    const tools2 = buildTools({ memory: A, config: resolveConfig({}), listStores, fallbackMemory: () => U });
+    const search2 = tools2.find((t) => t.name === 'memory_search');
+    const onlyUser = await search2.execute({ query: '画像探针', scope: 'user' }, exec);
+    onlyUser.includes(u1.id) ? ok('scope="user" 只搜用户级库并命中') : bad('scope="user"', onlyUser.slice(0, 120));
+    const notInWs = await search2.execute({ query: '画像探针' }, exec);
+    !notInWs.includes(u1.id) ? ok('scope="user" 的条目默认不在工作区检索里（互不串库）') : bad('用户级条目串进了工作区检索');
+    U.close();
+  }
 
   const noHit = await search.execute({ query: '这个词肯定不存在啊啊啊', scope: 'all' }, exec);
   noHit.includes('都没检索到') && noHit.includes('2 个工作区')
