@@ -434,17 +434,26 @@ $N = "C:\Users\10454\.dsh\dsh-runtimes\dsh-primary-runtime\dependencies\node\bin
 & $N D:\DSH-dev\memory-lite\tools\diag\diag-registry.mjs       # 注册表 → 工作区库发现链路
 & $N D:\DSH-dev\memory-lite\tools\diag\diag-schema-check.mjs   # 真实库的表/列（迁移是否生效）
 & $N D:\DSH-dev\memory-lite\tools\diag\diag-memory-state.mjs   # 两个库的条目/日志概览
+& $N D:\DSH-dev\memory-lite\tools\diag\diag-injections.mjs     # 注入流水（recall / recovery 各多少轮，反查条目）
 ```
 
-**当前状态（2026-10-11 12:30）**：四条校验器共 **141 项全绿**。
+**当前状态（2026-10-11 22:56 核对）**：五条校验器共 **170 项全绿**；
+V1 + V2 全链路（沉淀 → 蒸馏 → 召回 → **压缩后补回**）已全部在真机跑通。
 
-| 真机已确认 | 真机仍未验 |
+| 真机已确认（附证据） | 真机仍未验 |
 |---|---|
-| 自动沉淀（`turn-stopping` → 日志层写入） | 蒸馏能否真的产出条目（修了 `ctx.llm` 契约后待验） |
-| 召回注入（`agent/pre-step` → 消息里出现迁移来的记忆片段） | 压缩后补回（唯一完全没验过的机制） |
-| 设置页出现「记忆控制」+ 显示 27 条 | 空闲自动整理的实际触发 |
-| 面板读库（发现式定位 + 注册表） | 面板"用过 N 次"的显示 |
-| 老库迁移（`raw_preview` / `inject_count` 列已加，27 条完好） | `scope="all"` 在真机上扫到的库 |
+| 自动沉淀（`turn-stopping` → 日志层写入，日志层**不进提示词**） | `scope="all"` 跨工作区检索（离线校验器绿，真机未跑） |
+| 蒸馏产出条目（run 57：`ok` / `created 3` / 走 `deepseek-official/deepseek-flash`，**provider 是自动发现的**） | 空闲自动整理的实际触发 —— **验不了**：`autoDistill` 已按决定默认关，要验须先手动开 |
+| 召回注入（`agent/pre-step` → 本轮消息出现记忆片段；`injections` 表 `form=recall`） | |
+| **压缩后补回**（`/compact` 后第一轮：`injections` 表 `form=recovery` / 18 条 / 1369 字，与 `lib/prompt.js:131` 的话术逐字对上） | |
+| 注入计数（`inject_count` 累加，面板显示"用过 N 次"） | |
+| 设置页「记忆控制」+ 面板读库（发现式定位 + 注册表） | |
+| 老库迁移（`raw_preview` / `inject_count` 列已加，27 条完好） | |
+| 插件卡片元数据（`locale/en.json` 的 title + 顶层 `icon.svg`，重启后可见） | |
+
+> **怎么复核「压缩后补回」**（它只在你真的压缩过之后才有数据）：
+> `node tools/diag/diag-injections.mjs` → 看有没有 `form=recovery` 那一行。
+> 没有就说明压缩事件没被监听到，或该轮 `decision.kind !== 'enter'`。
 
 ### 设计取舍（记录理由，避免以后被"优化"掉）
 
