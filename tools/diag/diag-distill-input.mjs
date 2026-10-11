@@ -54,13 +54,23 @@ for (const r of rows) {
 }
 
 console.log('\n是否为"累积式"落库（后一条是否把前一条整段包含进去）:');
+const lcp = (a, b) => {
+  const n = Math.min(a.length, b.length);
+  let i = 0;
+  while (i < n && a.charCodeAt(i) === b.charCodeAt(i)) i += 1;
+  return i;
+};
 for (let i = 1; i < logs.length; i++) {
   const prev = String(logs[i - 1].text ?? '');
   const cur = String(logs[i].text ?? '');
   const probe = prev.slice(0, Math.min(2000, prev.length));
-  const contains = probe && cur.includes(probe);
+  const containsProbe = probe && cur.includes(probe);
+  const containsFull = prev.length > 0 && cur.includes(prev);
   const delta = cur.length - prev.length;
-  console.log(`  #${logs[i - 1].id} → #${logs[i].id}: 前一条被完整包含=${contains ? '是' : '否'} · 长度差 ${delta >= 0 ? '+' : ''}${delta}`);
+  const cp = lcp(cur, prev);
+  console.log(
+    `  #${logs[i - 1].id} → #${logs[i].id}: 前2000字被包含=${containsProbe ? '是' : '否'} · 整条被包含=${containsFull ? '是' : '否'} · 公共前缀 ${cp}（占前一条 ${((cp / (prev.length || 1)) * 100).toFixed(0)}%）· 长度差 ${delta >= 0 ? '+' : ''}${delta}`,
+  );
 }
 
 console.log('\n清洗后每条的头部（前 200 字，看是不是"这一轮真正的内容"）:');

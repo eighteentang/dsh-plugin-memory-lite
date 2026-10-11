@@ -23,6 +23,7 @@ import { captureTurn, extractTurnText } from '../../lib/capture.js';
 import { openMemory } from '../../lib/storage.js';
 import { resolveConfig, toJsonSchema, INDEX_MAX_BYTES, INDEX_TITLE_CHARS } from '../../lib/config.js';
 import { runDistill, buildUserPrompt, cleanLogText, pickLogExcerpt, DISTILL_MAX_CHARS_PER_LOG } from '../../lib/distill.js';
+import { diffAgainstPrevious } from '../../lib/text.js';
 import { DatabaseSync } from 'node:sqlite';
 
 const results = [];
@@ -205,6 +206,58 @@ console.log('=== verify-v1 ===\n');
     : bad('extractTurnText：抽取正文并推进水位', JSON.stringify(all));
   const none = extractTurnText(session, 3);
   none.count === 0 ? ok('extractTurnText：水位之后无新事件则不重复抽') : bad('extractTurnText：水位之后无新事件', JSON.stringify(none));
+  const gated = extractTurnText(session, 99); // 水位比所有 seq 都大（模拟"压缩后编号重启"）
+  gated.count === 0 && gated.maxSeqAll === 3
+    ? ok('extractTurnText：maxSeqAll 不受水位影响（重启守卫的依据）', `maxSeqAll=${gated.maxSeqAll}`)
+    : bad('extractTurnText：maxSeqAll', JSON.stringify(gated));
+
+  // 水位持久化（插件重启后内存水位归零，靠这一份兜底）
+  memory.setMeta('watermark:s9', '42');
+  memory.getMeta('watermark:s9') === '42'
+    ? ok('水位可持久化到 meta（重启后不丢）')
+    : bad('水位持久化', String(memory.getMeta('watermark:s9')));
+
+  // ── 采集清洗：日志层不再存系统样板 ──────────────────────────────────────
+  const boiler = '<system-reminder>\n（用户全局 AGENTS.md 那一大段样板）\n</system-reminder>\n';
+  const mixed = captureTurn({ memory, sessionId: 'c', workspace: root, text: `${boiler}${'a'.repeat(260)}` });
+  const storedC = memory._raw.prepare("SELECT text, chars FROM log_entries WHERE session_id = 'c' ORDER BY id DESC LIMIT 1").get();
+  mixed.written === true && storedC && !String(storedC.text).includes('system-reminder')
+    ? ok('采集清洗：样板不落库，只存真实内容', `${storedC.chars} 字`)
+    : bad('采集清洗：样板不落库', JSON.stringify({ r: mixed, t: String(storedC?.text ?? '').slice(0, 60) }));
+
+  const pureBoiler = captureTurn({ memory, sessionId: 'd', workspace: root, text: boiler.repeat(3) });
+  pureBoiler.reason === 'too-short'
+    ? ok('采集清洗：整轮都是样板 → 不落库（短闸门量的是真实内容）')
+    : bad('采集清洗：整轮都是样板', JSON.stringify(pureBoiler));
+
+  // ── 去重复前缀：根治"累积式落库"（实测 6/9 对相邻日志是包含关系）────────
+  const backdateSession = (sid) =>
+    memory._raw.prepare('UPDATE log_entries SET created_at = ? WHERE session_id = ?').run(Date.now() - 10 * 60 * 1000, sid);
+
+  const base = `第一段的真实内容。${'甲'.repeat(300)}`;
+  captureTurn({ memory, sessionId: 'e', workspace: root, text: base });
+  backdateSession('e');
+  const cum = captureTurn({ memory, sessionId: 'e', workspace: root, text: `${base}\n${'乙'.repeat(250)}` });
+  const storedE = memory._raw.prepare("SELECT text FROM log_entries WHERE session_id = 'e' ORDER BY id DESC LIMIT 1").get();
+  cum.written === true && cum.dedup === 'contains-prev' && String(storedE?.text ?? '') === '乙'.repeat(250)
+    ? ok('去重复前缀：累积文本只存增量', `丢掉 ${cum.dropped} 字，存 ${cum.chars} 字`)
+    : bad('去重复前缀：累积文本只存增量', JSON.stringify({ r: cum, t: String(storedE?.text ?? '').slice(0, 40) }));
+
+  backdateSession('e');
+  const unrelated = captureTurn({ memory, sessionId: 'e', workspace: root, text: `完全无关的另一段。${'丙'.repeat(250)}` });
+  const storedE2 = memory._raw.prepare("SELECT text FROM log_entries WHERE session_id = 'e' ORDER BY id DESC LIMIT 1").get();
+  unrelated.written === true && unrelated.dedup === 'unrelated' && String(storedE2?.text ?? '').startsWith('完全无关的另一段。')
+    ? ok('去重复前缀：无关内容原样存（不误伤）')
+    : bad('去重复前缀：无关内容原样存', JSON.stringify({ r: unrelated }));
+
+  // 纯函数边界：上一条太短时不比对（否则一个"好"字就能把正文切掉）
+  const cur = `新的一轮内容。${'丁'.repeat(250)}`;
+  diffAgainstPrevious(cur, '').reason === 'no-prev' && diffAgainstPrevious(cur, '好').reason === 'no-prev'
+    ? ok('去重复前缀：没有上一条 / 上一条太短 → 不比对')
+    : bad('去重复前缀：no-prev 分支', JSON.stringify(diffAgainstPrevious(cur, '好')));
+  diffAgainstPrevious(cur, cur).reason === 'identical' && diffAgainstPrevious(cur, cur).text === ''
+    ? ok('去重复前缀：与上一条完全相同 → 空（走 duplicate 分支）')
+    : bad('去重复前缀：identical', JSON.stringify(diffAgainstPrevious(cur, cur)));
 
   memory.close();
   rmSync(root, { recursive: true, force: true });

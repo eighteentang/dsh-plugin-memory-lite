@@ -331,9 +331,33 @@ export const apply = (ctx, rawConfig = {}) => {
           if (!sessionId) return;
           const memory = storeFor(workspaceOf(agent));
           if (!memory) return;
-          const since = seenSeq.get(sessionId) ?? -1;
-          const { text, untilSeq } = extractTurnText(session, since);
-          if (untilSeq > since) seenSeq.set(sessionId, untilSeq);
+          // 水位：先看进程内存，再看库里持久化的那份。
+          // ⚠ 实测教训：`seenSeq` 是**进程内存里的 Map** —— 插件一重启（或压缩后事件
+          //   重新物化）就归零，下一轮把**整段历史**又存一遍。实测相邻两条日志里
+          //   6/9 对满足"后一条完整包含前一条"，日志层因此膨胀、蒸馏输入被重复内容主导。
+          let since = seenSeq.get(sessionId);
+          if (since === undefined) {
+            const persisted = Number(memory.getMeta?.(`watermark:${sessionId}`));
+            since = Number.isFinite(persisted) && persisted >= 0 ? persisted : -1;
+          }
+          let { text, untilSeq, maxSeqAll } = extractTurnText(session, since);
+          // 守卫：压缩后快照重新物化时事件编号可能变小，那时持久化水位会让本轮
+          // **一条都抽不出来**（静默丢内容）。发现"最大 seq 比水位还小"就丢掉水位重来 ——
+          // 重来会带进整段历史，但 captureTurn 里的"与上一条去重"会把重复部分切掉。
+          // 分工：水位负责**省事**，内容比对负责**正确**。
+          if (since > 0 && maxSeqAll >= 0 && maxSeqAll < since) {
+            trace(ctx?.logger, 'capture-watermark-reset', { sessionId, since, maxSeqAll });
+            since = -1;
+            ({ text, untilSeq, maxSeqAll } = extractTurnText(session, -1));
+          }
+          if (untilSeq > since) {
+            seenSeq.set(sessionId, untilSeq);
+            try {
+              memory.setMeta?.(`watermark:${sessionId}`, String(untilSeq));
+            } catch {
+              /* 水位写不进去就退回内存水位，不影响本轮落盘 */
+            }
+          }
           const result = captureTurn({
             memory,
             sessionId,

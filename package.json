@@ -1,6 +1,6 @@
 {
   "name": "dsh-plugin-memory-lite",
-  "version": "1.2.0",
+  "version": "1.3.0",
   "description": "给 DSH 的本地优先跨会话记忆：每轮自动沉淀 + 空闲自动整理 + 按需注入。重点是注入纪律（压缩后补回、不重复注入、敏感内容不注入、删改走审批）。数据全部存在本地 SQLite，不联网、不上传。",
   "keywords": [
     "dsh",

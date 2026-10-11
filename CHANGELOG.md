@@ -8,8 +8,46 @@
 **怎么钉版本**（避免"装到一半上游改了"）：
 
 ```sh
-dsh plugin --profile <你的profile名> add github:eighteentang/dsh-plugin-memory-lite#v1.2.0
+dsh plugin --profile <你的profile名> add github:eighteentang/dsh-plugin-memory-lite#v1.3.0
 ```
+
+---
+
+## [1.3.0] - 2026-10-11
+
+### 修复
+
+- **日志层的"累积式膨胀"**（这是本版最重要的一条）
+  实测：10 轮对话写出了 **804 KB**（WAL 另有 1.4 MB），最大一条 **104,405 字**；
+  相邻两条日志里 **6/9 对**满足"后一条完整包含前一条" —— 也就是整段历史被反复落库。
+  后果不只是占地方：蒸馏的输入被重复内容主导，日志层也失去了"流水账"的意义。
+
+  根因是**水位失准**：`seenSeq` 是**进程内存里的 Map**，插件一重启就归零；
+  压缩后会话快照重新物化时事件编号也可能变小。两种情况都让"本轮新增"退化成"整段历史"。
+
+  三条修法分工明确（缺一条都不够）：
+
+  1. **水位持久化**到 `meta` 表（`watermark:<sessionId>`），重启后不再从头开始；
+  2. **重启守卫**：`extractTurnText()` 多返回一个 `maxSeqAll`（事件里真实存在的最大 seq，
+     不受水位过滤影响）。发现编号变小就丢弃水位重来 —— 没有这条守卫，水位会**静默跳过**
+     整轮内容（丢数据比重复严重得多）；
+  3. **内容去重**：新文本若**包含**上一条，只存多出来的那段。水位负责**省事**，
+     内容比对负责**正确**。
+
+  > 只认**包含**这种确定关系，不做"最长公共子串"这类模糊匹配 —— 一旦切错就是静默丢内容。
+  > 切不动就原样存：**宁可重复，不可丢失**。
+
+- **采集侧不再把系统样板写进日志**。日志一条 = 一整轮，其中大量内容是宿主以
+  `<system-reminder>` 注入的用户全局 `AGENTS.md` 等样板。现在落盘前先清洗
+  （实现与蒸馏侧**共用一份**：`lib/text.js`）。
+  最小长度闸门也移到清洗**之后** —— 否则量的只是样板长度，一轮全是样板也会过闸。
+
+### 变更
+
+- 日志内容不再是"逐字原样"：**先剔系统样板、再去重与前文重复的部分**才落盘。
+  已有数据可以用 `tools/migrate/clean-log-boilerplate.mjs` 按同规则重算一遍
+  （dry-run 默认；`--apply` 前会先 `VACUUM INTO` 备份，备份失败则中止）。
+  在作者本人的库上：**649,870 字 → 192,451 字（保留 29.6%），10 行里 6 行被判为重复**。
 
 ---
 
@@ -132,3 +170,4 @@ dsh plugin --profile <你的profile名> add github:eighteentang/dsh-plugin-memor
 
 [1.1.0]: https://github.com/eighteentang/dsh-plugin-memory-lite/releases/tag/v1.1.0
 [1.2.0]: https://github.com/eighteentang/dsh-plugin-memory-lite/releases/tag/v1.2.0
+[1.3.0]: https://github.com/eighteentang/dsh-plugin-memory-lite/releases/tag/v1.3.0
