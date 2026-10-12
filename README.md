@@ -49,8 +49,8 @@ dsh plugin --profile <你的profile名> add github:eighteentang/dsh-plugin-memor
 > （提示 `a URL must point at a git repository or a tarball`）—— 它只认**仓库根地址**
 > 或压缩包链接；版本要写成 `#v1.3.0` 拼在根地址后面。同理 `…/tree/main` 这类网页地址也不行。
 >
-> 这几条不是猜的：宿主侧的解析函数 `parseInstallSpec` 被抽出来逐例跑过，
-> 见 `tools/diag/diag-check-install-spec.mjs`。
+> 这几条不是猜的：宿主侧的解析函数 `parseInstallSpec` 曾被抽出来逐例跑过
+> （那是开发者本机的诊断脚本，**不随仓库发布** —— 见下方「关于本仓库不含开发工具」）。
 
 装完后**重启客户端**，设置页会出现 **「记忆控制」**。
 
@@ -213,6 +213,20 @@ $DSH_HOME/memory-lite/workspaces.json ← 库 → 工作区 的注册表
 - **每个工作区一个库**，默认只搜当前工作区；跨工作区要显式 `scope="all"`。
 - 日志层有容量上限（每会话约 200 条），超出会**先写归档文件再删库内行**（不静默丢）。
 - 空闲自动整理依赖宿主进程活着 —— 客户端关着的时候不会整理。
+
+---
+
+## 关于本仓库不含开发工具
+
+本仓库**只有插件本身**（`index.js` / `lib/` / `client/` / `locale/` / 图标 / 补丁 / README / LICENSE）。
+
+校验器（`verify-*.mjs`）、诊断脚本（`diag-*.mjs`）、迁移脚本与发布助手**不在仓库里**，
+它们只在开发者本机（原因：那些脚本含开发机的绝对路径与个人数据位置，不该跟着插件发给别人；
+这也是本项目的一贯纪律 —— 开发产物不进用户包）。
+
+如果你想自己验证这个插件的行为，用它的**运行时表现**验：
+装完之后在设置页看「记忆控制」，或者用 `memory_stats` / `memory_search` 这些工具直接问它。
+真机行为才是判据。
 
 ---
 
