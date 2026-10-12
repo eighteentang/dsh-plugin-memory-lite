@@ -93,7 +93,21 @@ window.__ModuleLoader__.load({
         cursor: 'pointer',
         fontSize: 13,
       },
-      list: { display: 'flex', flexDirection: 'column', gap: 6, maxHeight: 420, overflowY: 'auto' },
+      list: {
+        display: 'flex',
+        flexDirection: 'column',
+        gap: 5,
+        // ⚠ 这里踩过两个坑（2026-10-12 用户报"最下面的 list 出了问题"）：
+        //   ① `maxHeight: 420` 会把某一行**切一半**（420 ÷ 38 ≈ 11 行）—— 看着像坏了；
+        //      改成 60vh（行高 32 + 间距 5 = 每行 37px），但要接受"最后一行可能露一半"。
+        //      预留滚动条位置、`paddingRight` 别让滚动条压住最右的"状态"下拉。
+        //   ② 布局是"列表自己滚 + 设置页也滚"的嵌套滚动，滚轮焦点容易别扭；
+        //      所以高度给足（60vh），大多数情况不用滚。
+        maxHeight: '60vh',
+        overflowY: 'auto',
+        paddingRight: 6,
+        scrollbarGutter: 'stable',
+      },
       card: {
         border: '1px solid var(--dsw-alias-border-secondary, rgba(128,128,128,.28))',
         borderRadius: 8,
@@ -407,10 +421,20 @@ window.__ModuleLoader__.load({
                 `${s.kind === 'user' ? s.label : (s.workspace || s.label)}（${(s.entries ?? []).length} 条）`))),
             ])
           : null,
+        // 统计行：**只放计数**（绝对路径单独一行、可省略号）——
+        // 原来把 `库文件：D:\...\memory.db` 塞在同一行，窄面板上会折成 2-3 行。
         h('div', { key: 'stats', style: css.stat },
           `共 ${entries.length} 条` +
-            Object.entries(byLevel).map(([k, v]) => ` · ${LEVEL_LABEL[k] ?? k} ${v}`).join('') +
-            (currentStore?.dbPath ? ` · 库文件：${currentStore.dbPath}` : '')),
+            (statusFilter === 'all' ? '' : `（当前显示：${shown.length} 条）`) +
+            Object.entries(byLevel).map(([k, v]) => ` · ${LEVEL_LABEL[k] ?? k} ${v}`).join('')),
+        // 库文件路径：长、且不是每次都关心 → 单独一行 + 省略号，悬停看全文
+        currentStore?.dbPath
+          ? h('div', {
+              key: 'dbpath',
+              title: currentStore.dbPath,
+              style: { ...css.stat, opacity: 0.5, whiteSpace: 'nowrap', overflow: 'hidden', textOverflow: 'ellipsis' },
+            }, `库文件：${currentStore.dbPath}`)
+          : null,
         h('div', { key: 'bar', style: css.row }, [
           h('input', {
             key: 'q',
@@ -439,9 +463,10 @@ window.__ModuleLoader__.load({
             onClick: doDistill,
           }, busy === 'distill' ? '整理中…' : '立即整理'),
         ]),
-        // 状态说明：把「三个状态到底啥区别」写在界面上，别让用户猜
-        h('div', { key: 'legend', style: { ...css.stat, opacity: 0.65 } },
-          '状态说明：在用 = 有效且可能被召回；已完成 = 这件事做完了（内容仍有效）；已停用 = 不再被注入，但仍可搜到、可随时恢复'),
+        // ⚠ 这里原来还有一行"状态说明：在用 = 有效…"的长句 —— 删掉。
+        //   因为上面那个状态下拉的**每个选项里已经写了同样的解释**
+        //   （「在用（有效，会被召回）」），整句重复一遍白占两行。
+        //   判据：同一句话不要在一个界面里出现两次；解释放在用户真正会看的位置（下拉选项）。
         // 显示优先级：动作的错误 > 快照读取的错误；任一存在就不显示提示语
         (state.error ?? state.snapshotError)
           ? h('div', { key: 'err', style: { ...css.stat, color: 'var(--dsw-alias-text-error, #d33)' } },
