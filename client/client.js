@@ -134,7 +134,7 @@ window.__ModuleLoader__.load({
      * 也可能是宿主没重启）。面板底部显示这个字符串，一眼就能判定：
      *   看到的值 = 我刚改的值 → 新代码在跑；看到旧值 → 强制刷新（Ctrl+Shift+R）
      */
-    const CLIENT_BUILD = '样式重做 · 1013a';
+    const CLIENT_BUILD = '按钮深一档 · 1013b';
 
     /**
      * 样式表（一次性注入）。为什么用 `<style>` 而不是全内联：
@@ -157,8 +157,8 @@ window.__ModuleLoader__.load({
   width: 100%; min-width: 0; box-sizing: border-box; padding: 2px 0 4px;
   border-radius: var(--dsw-radius-lg);
   background:
-    radial-gradient(900px 160px at 0% 0%, color-mix(in srgb, var(--dsw-alias-brand-primary) 7%, transparent), transparent 72%),
-    linear-gradient(180deg, color-mix(in srgb, var(--dsw-alias-bg-layer-2) 60%, transparent), transparent 260px);
+    radial-gradient(900px 160px at 0% 0%, color-mix(in srgb, var(--dsw-alias-brand-primary) 4%, transparent), transparent 72%),
+    linear-gradient(180deg, color-mix(in srgb, var(--dsw-alias-bg-layer-2) 55%, transparent), transparent 260px);
 }
 .ml-card {
   border: 1px solid var(--dsw-alias-settings-card-stroke);
@@ -198,11 +198,15 @@ textarea.ml-input { line-height: 1.65; resize: vertical; }
 .ml-btn:hover:not(:disabled) { background: var(--dsw-alias-button-tool-bar-hover); }
 .ml-btn:disabled { opacity: .45; cursor: not-allowed; }
 .ml-btn-primary {
-  background: var(--dsw-alias-button-primary-fill);
+  /* 用户反馈"点进去有点刺眼、按钮换个稍深点的"（2026-10-13）：
+     静止态直接用设计系统里**深一档**的那个 token（-hover 就是比 -fill 深的那一档），
+     悬停再用 brightness 微调，不再叠一层更亮的颜色。
+     这样既满足"深一点"，又不用我自己调色（自己调色 = 脱离主题、深浅模式会崩）。 */
+  background: var(--dsw-alias-button-primary-hover);
   color: var(--dsw-alias-label-primary-inverted);
   border-color: transparent; font-weight: 600;
 }
-.ml-btn-primary:hover:not(:disabled) { background: var(--dsw-alias-button-primary-hover); }
+.ml-btn-primary:hover:not(:disabled) { filter: brightness(.95); }
 .ml-bar { display: flex; align-items: center; gap: 8px; flex-wrap: wrap; }
 .ml-stat { font-size: 12px; color: var(--dsw-alias-label-secondary); white-space: nowrap; }
 .ml-list {
@@ -237,9 +241,10 @@ textarea.ml-input { line-height: 1.65; resize: vertical; }
   background: color-mix(in srgb, var(--dsw-alias-brand-primary) 11%, transparent);
 }
 .ml-tag-warn {
-  color: var(--dsw-alias-state-error-primary);
-  border-color: color-mix(in srgb, var(--dsw-alias-state-error-primary) 42%, transparent);
-  background: color-mix(in srgb, var(--dsw-alias-state-error-secondary) 16%, transparent);
+  /* 敏感标记改用 warn 语义色（原来借用 error —— 语义不对，而且红色更"刺眼"） */
+  color: var(--dsw-alias-state-warn-primary);
+  border-color: color-mix(in srgb, var(--dsw-alias-state-warn-primary) 42%, transparent);
+  background: color-mix(in srgb, var(--dsw-alias-state-warn-primary) 12%, transparent);
 }
 .ml-err { font-size: 12px; color: var(--dsw-alias-state-error-primary); }
 .ml-ok { font-size: 12px; color: var(--dsw-alias-state-success-primary); }
@@ -509,7 +514,13 @@ textarea.ml-input { line-height: 1.65; resize: vertical; }
         ]);
       }
 
-      return h('div', { className: 'ml-panel' }, [
+      return h('div', {
+        className: 'ml-panel',
+        // 构建标记放到**属性**上（不占界面位置，但用开发者工具看元素就能读到）。
+        // 用户 2026-10-13 说"最下面那句小话可以删了" —— 删掉可见文字，
+        // 但保留可判定性：控制台那行 console.info 还在，属性也还在。
+        'data-build': CLIENT_BUILD,
+      }, [
         // ══ 块 1／3：人设与行为准则（两个文本框，**每个框各一个保存按钮**）══════
         // 用户明确要求："人设与行为准则这里记得加上保存按钮" —— 重排时不能把按钮画没了。
         // 每个框一个按钮（而不是一个"全部保存"）：两块是独立的两件事，改哪块存哪块。
@@ -598,8 +609,6 @@ textarea.ml-input { line-height: 1.65; resize: vertical; }
                 onStatus: (status) => doSetStatus(e.id, status),
               }))
             : h('div', { key: 'empty', className: 'ml-stat', style: { padding: '14px 2px' } }, '没有符合条件的记忆。')),
-        // 构建标记：一眼判断"浏览器里跑的是哪一版面板"（见 CLIENT_BUILD 的注释）
-        h('div', { key: 'build', className: 'ml-build' }, `面板构建：${CLIENT_BUILD}`),
       ]);
     }
 
@@ -669,6 +678,12 @@ textarea.ml-input { line-height: 1.65; resize: vertical; }
     function apply(ctx) {
       // 样式表先注入（一次），再做槽位注册 —— 面板还没渲染时它就已经在页面里了
       injectStyles();
+      // 构建标记也从控制台能看出来（界面上不再显示那行小字，见 CLIENT_BUILD 注释）
+      try {
+        console.info(`[memory-lite] 面板构建：${CLIENT_BUILD}`);
+      } catch {
+        /* 忽略 */
+      }
       // ⚠ 客户端 ctx 是「按声明才给服务」的代理：**未 inject 就取属性会抛**
       //    `cannot get property "slots" without inject`（真机报错原文，2026-10-11）。
       //    所以必须先 inject 声明，再在回调给的作用域里取服务。
