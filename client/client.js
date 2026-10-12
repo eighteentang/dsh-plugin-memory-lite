@@ -142,6 +142,12 @@ window.__ModuleLoader__.load({
         flex: '0 0 auto',
       },
       stat: { fontSize: 12, opacity: 0.8 },
+      /**
+       * 控制条：库 · 计数 · 搜索 · 状态 · 刷新 · 整理，**挤在一行**。
+       * 原来是 4 个独立横条（库选择器 / 统计 / 库文件路径 / 工具栏），用户说"太乱"。
+       * `flexWrap: wrap` 只在一行真装不下时才折；计数与按钮 `flex: 0 0 auto` 不被压缩。
+       */
+      bar: { display: 'flex', gap: 6, alignItems: 'center', flexWrap: 'wrap' },
     };
 
     /**
@@ -369,103 +375,103 @@ window.__ModuleLoader__.load({
       const byLevel = {};
       for (const e of entries) byLevel[e.level] = (byLevel[e.level] ?? 0) + 1;
 
+      /**
+       * 一个"人设 / 规范"文本框 + **它自己的保存按钮**。
+       *
+       * 用户明确要求过："人设与行为准则这里记得加上保存按钮" —— 重排布局时不能把按钮画没了。
+       * 每个框一个按钮（不是一个"全部保存"）：两块是独立的两件事，改哪块存哪块。
+       *
+       * ⚠ 这个函数**必须定义在 MemorySection 内部**：它要用组件自己的状态
+       *   （`personaBusy` / `persona` / `draft` / `savePersona` / `loadPersona`）。
+       *   我第一版把它放在组件外面（挨着 `css`），离线校验器立刻报
+       *   `personaBusy is not defined` —— 这正是我加那个校验器的意义。
+       */
+      function personaBox(slot, label, hint, buttonLabel, minHeight) {
+        const busyHere = personaBusy === slot;
+        const cant = personaBusy !== '' || persona?.ok === false;
+        return h('div', { key: slot, style: { display: 'flex', flexDirection: 'column', gap: 6 } }, [
+          h('div', { key: 'l', style: css.meta }, [
+            h('strong', { key: 'n' }, label),
+            h('span', { key: 'd' }, hint),
+          ]),
+          h('textarea', {
+            key: 'ta',
+            style: { ...css.input, minHeight, width: '100%', fontFamily: 'inherit', resize: 'vertical', lineHeight: 1.6 },
+            placeholder: '想写什么就写什么，没有任何格式要求（不用标题、不用 markdown）。',
+            value: draft[slot],
+            disabled: persona?.ok === false,
+            onChange: (e) => setDraft((d) => ({ ...d, [slot]: e.target.value })),
+          }),
+          h('div', { key: 'acts', style: css.row }, [
+            h('button', {
+              key: 's',
+              // 保存是主要操作 → 给一点视觉重量（其余按钮是透明底）
+              style: { ...css.button, fontWeight: 600 },
+              disabled: cant,
+              onClick: () => savePersona(slot),
+            }, busyHere ? '保存中…' : buttonLabel),
+            slot === 'rules'
+              ? h('button', { key: 'r', style: css.button, disabled: personaBusy !== '', onClick: loadPersona }, '重新读取')
+              : null,
+            h('span', { key: 'hint', style: css.stat }, slot === 'persona'
+              ? '保存时会先备份；文本框里写什么，文件里就是什么'
+              : '保存后下一轮立刻生效，不用重启'),
+          ].filter(Boolean)),
+        ]);
+      }
+
       return h('div', { style: css.wrap }, [
-        // ── 人设 / 工作规范（读写宿主 AGENTS.md）──────────────────────────
+        // ══ 块 1／3：人设与行为准则（两个文本框，**每个框各一个保存按钮**）══════
+        // 用户明确要求："人设与行为准则这里记得加上保存按钮" —— 重排时不能把按钮画没了。
+        // 每个框一个按钮（而不是一个"全部保存"）：两块是独立的两件事，改哪块存哪块。
         h('div', { key: 'persona', style: css.card }, [
           h('div', { key: 'h', style: css.meta }, [
             h('strong', { key: 't' }, '人设与行为准则'),
-            h('span', { key: 'f' }, persona?.dir ? `存在插件自己的目录：${persona.dir}` : '每轮自动带进提示词（不依赖其它文件）'),
+            h('span', { key: 'f' }, persona?.dir ? `文件：${persona.dir}` : '每轮自动带进提示词'),
           ]),
           persona?.ok === false
             ? h('div', { key: 'pe', style: { ...css.stat, color: 'var(--dsw-alias-text-error, #d33)' } }, `读不到：${persona.error}`)
             : null,
-          h('div', { key: 'grid', style: { display: 'flex', flexDirection: 'column', gap: 10 } }, [
-            h('div', { key: 'p1', style: { display: 'flex', flexDirection: 'column', gap: 6 } }, [
-              h('div', { key: 'l', style: css.meta }, [
-                h('strong', { key: 'n' }, '人设设定'),
-                h('span', { key: 'd' }, '我是谁 / 什么语气 —— 每轮都会带上'),
-              ]),
-              h('textarea', {
-                key: 'ta',
-                style: { ...css.input, minHeight: 120, width: '100%', fontFamily: 'inherit', resize: 'vertical', lineHeight: 1.6 },
-                placeholder: '想写什么就写什么，没有任何格式要求（不用标题、不用 markdown）。',
-                value: draft.persona,
-                onChange: (e) => setDraft((d) => ({ ...d, persona: e.target.value })),
-                disabled: persona?.ok === false,
-              }),
-              h('div', { key: 'acts', style: css.row }, [
-                h('button', { key: 's', style: css.button, disabled: personaBusy !== '' || persona?.ok === false, onClick: () => savePersona('persona') },
-                  personaBusy === 'persona' ? '保存中…' : '保存人设'),
-                h('span', { key: 'hint', style: css.stat }, '保存时会先备份；文本框里写什么，文件里就是什么'),
-              ]),
-            ]),
-            h('div', { key: 'p2', style: { display: 'flex', flexDirection: 'column', gap: 6 } }, [
-              h('div', { key: 'l', style: css.meta }, [
-                h('strong', { key: 'n' }, '工作规范与行为准则'),
-                h('span', { key: 'd' }, '该怎么做 —— 每轮都会带上'),
-              ]),
-              h('textarea', {
-                key: 'ta',
-                style: { ...css.input, minHeight: 160, width: '100%', fontFamily: 'inherit', resize: 'vertical', lineHeight: 1.6 },
-                placeholder: '想写什么就写什么，没有任何格式要求。',
-                value: draft.rules,
-                onChange: (e) => setDraft((d) => ({ ...d, rules: e.target.value })),
-                disabled: persona?.ok === false,
-              }),
-              h('div', { key: 'acts', style: css.row }, [
-                h('button', { key: 's', style: css.button, disabled: personaBusy !== '' || persona?.ok === false, onClick: () => savePersona('rules') },
-                  personaBusy === 'rules' ? '保存中…' : '保存规范'),
-                h('button', { key: 'r', style: css.button, disabled: personaBusy !== '', onClick: loadPersona }, '重新读取'),
-                h('span', { key: 'hint', style: css.stat }, '保存后下一轮立刻生效，不用重启'),
-              ]),
-            ]),
-          ]),
+          personaBox('persona', '人设设定', '我是谁 / 什么语气 —— 每轮都会带上', '保存人设', 120),
+          personaBox('rules', '工作规范与行为准则', '该怎么做 —— 每轮都会带上', '保存规范', 160),
         ]),
-        // 库选择器：只在发现多个库时出现。不猜"哪个工作区在活跃"——列出来让你选。
-        state.stores.length > 1
-          ? h('div', { key: 'stores', style: css.row }, [
-              h('select', {
-                key: 'sel',
-                style: { ...css.input, flex: '1 1 320px' },
+        // ══ 块 2／3：一行控制条（库 · 计数 · 搜索 · 状态 · 刷新 · 整理）══════
+        // 原来是 4 个独立横条（库选择器 / 统计 / 库文件路径 / 工具栏），凑成一行。
+        // 库文件的绝对路径塞进下拉的悬停提示里，不再单独占一行。
+        h('div', { key: 'bar', style: css.bar }, [
+          state.stores.length > 1
+            ? h('select', {
+                key: 'store',
+                title: currentStore?.dbPath ? `库文件：${currentStore.dbPath}` : '记忆库',
+                style: { ...css.input, flex: '0 0 auto', maxWidth: 220 },
                 value: String(state.active),
                 onChange: (e) => setState((s) => ({ ...s, active: Number(e.target.value) })),
               }, state.stores.map((s, i) => h('option', { key: `st${i}`, value: String(i) },
-                // V1.7：用户级库（workspace=null）显示它的 label —— 「用户级（跨工作区）」。
-                // 以后加别的非工作区库也在 label 里说明，别落下纯目录名。
-                `${s.kind === 'user' ? s.label : (s.workspace || s.label)}（${(s.entries ?? []).length} 条）`))),
-            ])
-          : null,
-        // 统计行：**只放计数**（绝对路径单独一行、可省略号）——
-        // 原来把 `库文件：D:\...\memory.db` 塞在同一行，窄面板上会折成 2-3 行。
-        h('div', { key: 'stats', style: css.stat },
-          `共 ${entries.length} 条` +
-            (statusFilter === 'all' ? '' : `（当前显示：${shown.length} 条）`) +
-            Object.entries(byLevel).map(([k, v]) => ` · ${LEVEL_LABEL[k] ?? k} ${v}`).join('')),
-        // 库文件路径：长、且不是每次都关心 → 单独一行 + 省略号，悬停看全文
-        currentStore?.dbPath
-          ? h('div', {
-              key: 'dbpath',
-              title: currentStore.dbPath,
-              style: { ...css.stat, opacity: 0.5, whiteSpace: 'nowrap', overflow: 'hidden', textOverflow: 'ellipsis' },
-            }, `库文件：${currentStore.dbPath}`)
-          : null,
-        h('div', { key: 'bar', style: css.row }, [
+                // 用户级库（workspace=null）显示它的 label ——「用户级（跨工作区）」
+                `${s.kind === 'user' ? s.label : (s.workspace || s.label)}（${(s.entries ?? []).length} 条）`)))
+            : null,
+          h('span', { key: 'n', style: { ...css.stat, whiteSpace: 'nowrap', flex: '0 0 auto' } },
+            `共 ${entries.length} 条` +
+              (statusFilter === 'all' ? '' : `（当前显示：${shown.length} 条）`) +
+              Object.entries(byLevel).map(([k, v]) => ` · ${LEVEL_LABEL[k] ?? k} ${v}`).join('')),
+          h('span', { key: 'sp', style: { flex: '1 1 8px' } }),
           h('input', {
             key: 'q',
-            style: css.input,
-            placeholder: '搜索内容 / 标题 / 关键词 / 项目',
+            style: { ...css.input, flex: '0 1 240px', minWidth: 120 },
+            placeholder: '搜索标题 / 正文 / 关键词',
             value: query,
             onChange: (e) => setQuery(e.target.value),
           }),
           h('select', {
             key: 's',
-            style: { ...css.input, flex: '0 0 auto', minWidth: 110 },
+            style: { ...css.input, flex: '0 0 auto' },
+            title: '在用 = 有效且可能被召回；已完成 = 这件事做完了（内容仍有效）；已停用 = 不再被注入，但仍可搜到、可恢复',
             value: statusFilter,
             onChange: (e) => setStatusFilter(e.target.value),
           }, [
-            h('option', { key: 'a', value: 'active' }, '在用（有效，会被召回）'),
-            h('option', { key: 's', value: 'stale' }, '已完成（做完了，内容仍有效）'),
-            h('option', { key: 'x', value: 'archived' }, '已停用（不再注入，可恢复）'),
+            h('option', { key: 'a', value: 'active' }, '在用（会被召回）'),
+            h('option', { key: 's', value: 'stale' }, '已完成（内容仍有效）'),
+            h('option', { key: 'x', value: 'archived' }, '已停用（可恢复）'),
             h('option', { key: 'all', value: 'all' }, '全部'),
           ]),
           h('button', { key: 'r', style: css.button, onClick: reload, disabled: state.loading || busy !== '' }, '刷新'),
@@ -473,14 +479,10 @@ window.__ModuleLoader__.load({
             key: 'd',
             style: css.button,
             disabled: busy !== '',
-            title: '把「每轮自动记录的流水」用模型整理成长期条目。会调用一次模型（消耗少量额度），需要先在插件配置里开启 autoDistill 或点这个按钮手动触发',
+            title: '把「每轮自动记录的流水」用模型整理成长期条目。会调用一次模型（消耗少量额度）',
             onClick: doDistill,
           }, busy === 'distill' ? '整理中…' : '立即整理'),
         ]),
-        // ⚠ 这里原来还有一行"状态说明：在用 = 有效…"的长句 —— 删掉。
-        //   因为上面那个状态下拉的**每个选项里已经写了同样的解释**
-        //   （「在用（有效，会被召回）」），整句重复一遍白占两行。
-        //   判据：同一句话不要在一个界面里出现两次；解释放在用户真正会看的位置（下拉选项）。
         // 显示优先级：动作的错误 > 快照读取的错误；任一存在就不显示提示语
         (state.error ?? state.snapshotError)
           ? h('div', { key: 'err', style: { ...css.stat, color: 'var(--dsw-alias-text-error, #d33)' } },
@@ -489,6 +491,7 @@ window.__ModuleLoader__.load({
         !(state.error ?? state.snapshotError) && state.notice
           ? h('div', { key: 'notice', style: { ...css.stat, color: 'var(--dsw-alias-text-secondary, inherit)' } }, state.notice)
           : null,
+        // ══ 块 3／3：列表 ═══════════════════════════════════════════════════
         state.loading
           ? h('div', { key: 'load', style: css.stat }, '读取中…')
           : h('div', { key: 'list', style: css.list }, shown.length
