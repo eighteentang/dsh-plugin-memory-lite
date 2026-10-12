@@ -85,69 +85,22 @@ window.__ModuleLoader__.load({
         boxSizing: 'border-box',
       },
       row: { display: 'flex', gap: 8, alignItems: 'center', flexWrap: 'wrap' },
-      input: {
-        flex: '1 1 220px',
-        minWidth: 160,
-        padding: '6px 8px',
-        borderRadius: 6,
-        border: '1px solid var(--dsw-alias-border-secondary, rgba(128,128,128,.35))',
-        background: 'transparent',
-        color: 'inherit',
-        fontSize: 13,
-      },
-      button: {
-        padding: '6px 10px',
-        borderRadius: 6,
-        border: '1px solid var(--dsw-alias-border-secondary, rgba(128,128,128,.35))',
-        background: 'transparent',
-        color: 'inherit',
-        cursor: 'pointer',
-        fontSize: 13,
-      },
-      list: {
-        display: 'flex',
-        flexDirection: 'column',
-        gap: 5,
-        // ⚠ 这里踩过两个坑（2026-10-12 用户报"最下面的 list 出了问题"）：
-        //   ① `maxHeight: 420` 会把某一行**切一半**（420 ÷ 38 ≈ 11 行）—— 看着像坏了；
-        //   ② 列表自己滚 + 设置页也滚 = 嵌套滚动。
-        // 高度用**像素**，不用 `vh`：vh 依赖视口，而面板挂在宿主的设置页里，
-        // 万一宿主给的容器高度不确定，vh 会把列表算成 0 高（表现就是"像没有内容"）。
-        maxHeight: 520,
-        overflowY: 'auto',
-        overflowX: 'hidden',
-        minWidth: 0,
-        paddingRight: 6,
-        scrollbarGutter: 'stable',
-      },
-      card: {
-        border: '1px solid var(--dsw-alias-border-secondary, rgba(128,128,128,.28))',
-        borderRadius: 8,
-        padding: '8px 10px',
-        display: 'flex',
-        flexDirection: 'column',
-        gap: 4,
-      },
-      meta: { fontSize: 12, opacity: 0.72, display: 'flex', gap: 8, flexWrap: 'wrap' },
-      body: { fontSize: 13, whiteSpace: 'pre-wrap', wordBreak: 'break-word' },
-      tag: {
-        fontSize: 11,
-        lineHeight: '16px',
-        padding: '1px 6px',
-        borderRadius: 999,
-        border: '1px solid var(--dsw-alias-border-secondary, rgba(128,128,128,.35))',
-        opacity: 0.9,
-        // ⚠ 这两条是"标签占两行"的解药：不换行 + 不参与伸缩（宽度由列/内容决定）
-        whiteSpace: 'nowrap',
-        flex: '0 0 auto',
-      },
-      stat: { fontSize: 12, opacity: 0.8 },
-      /**
-       * 控制条：库 · 计数 · 搜索 · 状态 · 刷新 · 整理，**挤在一行**。
-       * 原来是 4 个独立横条（库选择器 / 统计 / 库文件路径 / 工具栏），用户说"太乱"。
-       * `flexWrap: wrap` 只在一行真装不下时才折；计数与按钮 `flex: 0 0 auto` 不被压缩。
-       */
-      bar: { display: 'flex', gap: 6, alignItems: 'center', flexWrap: 'wrap' },
+      // ⚠ 下面这些**只放布局**（flex/grid/尺寸），外观（颜色/边框/圆角/阴影/花纹）
+      //   全部搬到上面的 CSS_TEXT 里（用主题 token + 支持 :hover/:focus）。
+      //   原来这里硬编码了一个**不存在**的边框 token 名（真实的是 border-l1..l4）——
+      //   名字写错不会报错，只会静默回退到硬编码的灰色，深浅主题都不跟随。
+      //   （注释里故意不再写出那个错名字：token 校验器会扫全文件文本，写了会被误报 —— 经验库 E37）
+      input: { flex: '1 1 220px', minWidth: 160 },
+      button: {},
+      list: {},
+      card: {},
+      meta: { display: 'flex', gap: 8, flexWrap: 'wrap', alignItems: 'baseline' },
+      body: { whiteSpace: 'pre-wrap', wordBreak: 'break-word' },
+      // ⚠ 这两条是"标签占两行"的解药：不换行 + 不参与伸缩（宽度由列/内容决定）
+      tag: { whiteSpace: 'nowrap', flex: '0 0 auto' },
+      stat: {},
+      /** 控制条：库 · 计数 · 搜索 · 状态 · 刷新 · 整理，**挤在一行** */
+      bar: { display: 'flex', gap: 8, alignItems: 'center', flexWrap: 'wrap' },
     };
 
     /**
@@ -164,11 +117,9 @@ window.__ModuleLoader__.load({
     function Tag({ children, warn, style, title }) {
       return h('span', {
         title,
-        style: {
-          ...css.tag,
-          ...(warn ? { color: 'var(--dsw-alias-text-warning, #c98a00)' } : null),
-          ...(style ?? null),
-        },
+        // 外观在 CSS 类里（.ml-tag / .ml-tag-level / .ml-tag-warn），这里只留"不许换行"
+        className: `ml-tag${warn ? ' ml-tag-warn' : ''}`,
+        style: { ...css.tag, ...(style ?? null) },
       }, children);
     }
 
@@ -183,7 +134,134 @@ window.__ModuleLoader__.load({
      * 也可能是宿主没重启）。面板底部显示这个字符串，一眼就能判定：
      *   看到的值 = 我刚改的值 → 新代码在跑；看到旧值 → 强制刷新（Ctrl+Shift+R）
      */
-    const CLIENT_BUILD = '3块布局 · 1013';
+    const CLIENT_BUILD = '样式重做 · 1013a';
+
+    /**
+     * 样式表（一次性注入）。为什么用 `<style>` 而不是全内联：
+     *   ① **悬停 / 焦点**（`:hover` / `:focus`）内联样式根本做不到，而列表行高亮、
+     *      输入框焦点环都靠它；47 行的大列表没有悬停反馈会很难用。
+     *   ② 外观（颜色/圆角/阴影/纹理）集中一处，比散在 JSX 里好改。
+     *   ③ **只用 DSH 自己的主题 token**，不自己造颜色 —— 深浅主题自动跟随。
+     *      token 名取自 asar 里真实存在的那 400 多个，`verify-theme-tokens.mjs` 可校。
+     *
+     * 设计取向（按用户记过的偏好：**不要纯色背景**）：
+     *   · 底：品牌色极淡光晕 + 邻近色渐隐（不是纯色块）
+     *   · 扁平化，圆角与阴影用主题变量的层级
+     *   · **取消"每条一个描边圆角卡片"**（47 个堆在一起非常乱）→ 一个容器 +
+     *     发丝分隔线 + 斑马纹 + 悬停高亮
+     */
+    const STYLE_ID = 'dsh-memory-lite-style';
+    const CSS_TEXT = `
+.ml-panel {
+  display: flex; flex-direction: column; gap: 12px;
+  width: 100%; min-width: 0; box-sizing: border-box; padding: 2px 0 4px;
+  border-radius: var(--dsw-radius-lg);
+  background:
+    radial-gradient(900px 160px at 0% 0%, color-mix(in srgb, var(--dsw-alias-brand-primary) 7%, transparent), transparent 72%),
+    linear-gradient(180deg, color-mix(in srgb, var(--dsw-alias-bg-layer-2) 60%, transparent), transparent 260px);
+}
+.ml-card {
+  border: 1px solid var(--dsw-alias-settings-card-stroke);
+  background: var(--dsw-alias-settings-card-fill);
+  border-radius: var(--dsw-radius-lg);
+  padding: 12px 14px;
+  box-shadow: var(--dsw-shadow-lv1);
+  display: flex; flex-direction: column; gap: 10px;
+}
+.ml-h { display: flex; align-items: baseline; gap: 8px; flex-wrap: wrap; }
+.ml-h b { font-size: 13.5px; color: var(--dsw-alias-label-primary); }
+.ml-h span { font-size: 12px; color: var(--dsw-alias-label-dimmed); }
+.ml-label { font-size: 12.5px; color: var(--dsw-alias-label-secondary); display: flex; align-items: baseline; gap: 8px; flex-wrap: wrap; }
+.ml-label b { font-size: 13px; color: var(--dsw-alias-label-primary); }
+.ml-input, .ml-select {
+  font: inherit; font-size: 13px; color: var(--dsw-alias-label-primary);
+  background: var(--dsw-alias-bg-layer-1);
+  border: 1px solid var(--dsw-alias-border-l2);
+  border-radius: var(--dsw-radius-md);
+  padding: 5px 8px; box-sizing: border-box;
+}
+.ml-input::placeholder { color: var(--dsw-alias-label-dimmed); }
+.ml-input:focus, .ml-select:focus {
+  outline: none;
+  border-color: var(--dsw-alias-brand-primary);
+  box-shadow: 0 0 0 3px color-mix(in srgb, var(--dsw-alias-brand-primary) 22%, transparent);
+}
+textarea.ml-input { line-height: 1.65; resize: vertical; }
+.ml-btn {
+  font: inherit; font-size: 13px; cursor: pointer;
+  color: var(--dsw-alias-label-primary);
+  background: var(--dsw-alias-button-tool-bar-fill);
+  border: 1px solid var(--dsw-alias-border-l2);
+  border-radius: var(--dsw-radius-md);
+  padding: 5px 10px; white-space: nowrap;
+}
+.ml-btn:hover:not(:disabled) { background: var(--dsw-alias-button-tool-bar-hover); }
+.ml-btn:disabled { opacity: .45; cursor: not-allowed; }
+.ml-btn-primary {
+  background: var(--dsw-alias-button-primary-fill);
+  color: var(--dsw-alias-label-primary-inverted);
+  border-color: transparent; font-weight: 600;
+}
+.ml-btn-primary:hover:not(:disabled) { background: var(--dsw-alias-button-primary-hover); }
+.ml-bar { display: flex; align-items: center; gap: 8px; flex-wrap: wrap; }
+.ml-stat { font-size: 12px; color: var(--dsw-alias-label-secondary); white-space: nowrap; }
+.ml-list {
+  display: flex; flex-direction: column; box-sizing: border-box;
+  max-height: 520px; overflow-y: auto; overflow-x: hidden;
+  border: 1px solid var(--dsw-alias-settings-card-stroke);
+  border-radius: var(--dsw-radius-lg);
+  background: var(--dsw-alias-settings-card-fill);
+  scrollbar-gutter: stable;
+}
+.ml-row {
+  display: grid; align-items: center; column-gap: 10px;
+  padding: 0 12px; box-sizing: border-box; flex: 0 0 auto;
+  border-bottom: 1px solid var(--dsw-alias-border-l1);
+}
+.ml-row:last-child { border-bottom: none; }
+.ml-row:nth-child(even) { background: color-mix(in srgb, var(--dsw-alias-bg-layer-2) 45%, transparent); }
+.ml-row:hover { background: var(--dsw-alias-button-tool-bar-hover); }
+.ml-title { font-size: 13px; min-width: 0; color: var(--dsw-alias-label-primary); overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.ml-num { font-size: 12px; text-align: right; white-space: nowrap; color: var(--dsw-alias-label-dimmed); }
+.ml-num-on { color: var(--dsw-alias-label-secondary); }
+.ml-tag {
+  font-size: 11px; line-height: 16px; padding: 1px 7px; border-radius: 999px;
+  white-space: nowrap; flex: 0 0 auto; box-sizing: border-box;
+  color: var(--dsw-alias-label-secondary);
+  border: 1px solid var(--dsw-alias-border-l2);
+  background: color-mix(in srgb, var(--dsw-alias-bg-layer-2) 55%, transparent);
+}
+.ml-tag-level {
+  color: var(--dsw-alias-label-primary);
+  border-color: color-mix(in srgb, var(--dsw-alias-brand-primary) 26%, transparent);
+  background: color-mix(in srgb, var(--dsw-alias-brand-primary) 11%, transparent);
+}
+.ml-tag-warn {
+  color: var(--dsw-alias-state-error-primary);
+  border-color: color-mix(in srgb, var(--dsw-alias-state-error-primary) 42%, transparent);
+  background: color-mix(in srgb, var(--dsw-alias-state-error-secondary) 16%, transparent);
+}
+.ml-err { font-size: 12px; color: var(--dsw-alias-state-error-primary); }
+.ml-ok { font-size: 12px; color: var(--dsw-alias-state-success-primary); }
+.ml-build { font-size: 11px; color: var(--dsw-alias-label-dimmed); text-align: right; }
+.ml-scroll::-webkit-scrollbar { width: 10px; }
+.ml-scroll::-webkit-scrollbar-thumb { background: var(--dsw-alias-scrollbar-bg-l1); border-radius: 999px; }
+.ml-scroll::-webkit-scrollbar-thumb:hover { background: var(--dsw-alias-scrollbar-hover-l1); }
+`;
+
+    /** 把样式表注入一次（客户端半跑在浏览器里；没有 document 就安静跳过，不要抛） */
+    function injectStyles() {
+      try {
+        if (typeof document === 'undefined') return;
+        if (document.getElementById?.(STYLE_ID)) return;
+        const el = document.createElement('style');
+        el.id = STYLE_ID;
+        el.textContent = CSS_TEXT;
+        (document.head ?? document.body)?.appendChild?.(el);
+      } catch {
+        /* 注入失败不该让面板挂掉（大不了没样式） */
+      }
+    }
 
     /** 同源请求宿主路由。为什么不用官方 remote：RPC 需要 TypertRemoteService 基类，解析不到。 */
     async function api(path, body) {
@@ -400,13 +478,14 @@ window.__ModuleLoader__.load({
         const busyHere = personaBusy === slot;
         const cant = personaBusy !== '' || persona?.ok === false;
         return h('div', { key: slot, style: { display: 'flex', flexDirection: 'column', gap: 6 } }, [
-          h('div', { key: 'l', style: css.meta }, [
-            h('strong', { key: 'n' }, label),
+          h('div', { key: 'l', className: 'ml-label' }, [
+            h('b', { key: 'n' }, label),
             h('span', { key: 'd' }, hint),
           ]),
           h('textarea', {
             key: 'ta',
-            style: { ...css.input, minHeight, width: '100%', fontFamily: 'inherit', resize: 'vertical', lineHeight: 1.6 },
+            className: 'ml-input',
+            style: { minHeight, width: '100%', fontFamily: 'inherit' },
             placeholder: '想写什么就写什么，没有任何格式要求（不用标题、不用 markdown）。',
             value: draft[slot],
             disabled: persona?.ok === false,
@@ -415,32 +494,32 @@ window.__ModuleLoader__.load({
           h('div', { key: 'acts', style: css.row }, [
             h('button', {
               key: 's',
-              // 保存是主要操作 → 给一点视觉重量（其余按钮是透明底）
-              style: { ...css.button, fontWeight: 600 },
+              // 保存是主要操作 → 用主按钮样式（其余是次按钮）
+              className: 'ml-btn ml-btn-primary',
               disabled: cant,
               onClick: () => savePersona(slot),
             }, busyHere ? '保存中…' : buttonLabel),
             slot === 'rules'
-              ? h('button', { key: 'r', style: css.button, disabled: personaBusy !== '', onClick: loadPersona }, '重新读取')
+              ? h('button', { key: 'r', className: 'ml-btn', disabled: personaBusy !== '', onClick: loadPersona }, '重新读取')
               : null,
-            h('span', { key: 'hint', style: css.stat }, slot === 'persona'
+            h('span', { key: 'hint', className: 'ml-stat' }, slot === 'persona'
               ? '保存时会先备份；文本框里写什么，文件里就是什么'
               : '保存后下一轮立刻生效，不用重启'),
           ].filter(Boolean)),
         ]);
       }
 
-      return h('div', { style: css.wrap }, [
+      return h('div', { className: 'ml-panel' }, [
         // ══ 块 1／3：人设与行为准则（两个文本框，**每个框各一个保存按钮**）══════
         // 用户明确要求："人设与行为准则这里记得加上保存按钮" —— 重排时不能把按钮画没了。
         // 每个框一个按钮（而不是一个"全部保存"）：两块是独立的两件事，改哪块存哪块。
-        h('div', { key: 'persona', style: css.card }, [
-          h('div', { key: 'h', style: css.meta }, [
+        h('div', { key: 'persona', className: 'ml-card' }, [
+          h('div', { key: 'h', className: 'ml-h' }, [
             h('strong', { key: 't' }, '人设与行为准则'),
             h('span', { key: 'f' }, persona?.dir ? `文件：${persona.dir}` : '每轮自动带进提示词'),
           ]),
           persona?.ok === false
-            ? h('div', { key: 'pe', style: { ...css.stat, color: 'var(--dsw-alias-text-error, #d33)' } }, `读不到：${persona.error}`)
+            ? h('div', { key: 'pe', className: 'ml-err' }, `读不到：${persona.error}`)
             : null,
           personaBox('persona', '人设设定', '我是谁 / 什么语气 —— 每轮都会带上', '保存人设', 120),
           personaBox('rules', '工作规范与行为准则', '该怎么做 —— 每轮都会带上', '保存规范', 160),
@@ -448,33 +527,36 @@ window.__ModuleLoader__.load({
         // ══ 块 2／3：一行控制条（库 · 计数 · 搜索 · 状态 · 刷新 · 整理）══════
         // 原来是 4 个独立横条（库选择器 / 统计 / 库文件路径 / 工具栏），凑成一行。
         // 库文件的绝对路径塞进下拉的悬停提示里，不再单独占一行。
-        h('div', { key: 'bar', style: css.bar }, [
+        h('div', { key: 'bar', className: 'ml-bar' }, [
           state.stores.length > 1
             ? h('select', {
                 key: 'store',
+                className: 'ml-select',
                 title: currentStore?.dbPath ? `库文件：${currentStore.dbPath}` : '记忆库',
-                style: { ...css.input, flex: '0 0 auto', maxWidth: 220 },
+                style: { flex: '0 0 auto', maxWidth: 240 },
                 value: String(state.active),
                 onChange: (e) => setState((s) => ({ ...s, active: Number(e.target.value) })),
               }, state.stores.map((s, i) => h('option', { key: `st${i}`, value: String(i) },
                 // 用户级库（workspace=null）显示它的 label ——「用户级（跨工作区）」
                 `${s.kind === 'user' ? s.label : (s.workspace || s.label)}（${(s.entries ?? []).length} 条）`)))
             : null,
-          h('span', { key: 'n', style: { ...css.stat, whiteSpace: 'nowrap', flex: '0 0 auto' } },
+          h('span', { key: 'n', className: 'ml-stat', style: { flex: '0 0 auto' } },
             `共 ${entries.length} 条` +
               (statusFilter === 'all' ? '' : `（当前显示：${shown.length} 条）`) +
               Object.entries(byLevel).map(([k, v]) => ` · ${LEVEL_LABEL[k] ?? k} ${v}`).join('')),
           h('span', { key: 'sp', style: { flex: '1 1 8px' } }),
           h('input', {
             key: 'q',
-            style: { ...css.input, flex: '0 1 240px', minWidth: 120 },
+            className: 'ml-input',
+            style: { flex: '0 1 240px', minWidth: 120 },
             placeholder: '搜索标题 / 正文 / 关键词',
             value: query,
             onChange: (e) => setQuery(e.target.value),
           }),
           h('select', {
             key: 's',
-            style: { ...css.input, flex: '0 0 auto' },
+            className: 'ml-select',
+            style: { flex: '0 0 auto' },
             title: '在用 = 有效且可能被召回；已完成 = 这件事做完了（内容仍有效）；已停用 = 不再被注入，但仍可搜到、可恢复',
             value: statusFilter,
             onChange: (e) => setStatusFilter(e.target.value),
@@ -484,10 +566,11 @@ window.__ModuleLoader__.load({
             h('option', { key: 'x', value: 'archived' }, '已停用（可恢复）'),
             h('option', { key: 'all', value: 'all' }, '全部'),
           ]),
-          h('button', { key: 'r', style: css.button, onClick: reload, disabled: state.loading || busy !== '' }, '刷新'),
+          h('button', { key: 'r', className: 'ml-btn', onClick: reload, disabled: state.loading || busy !== '' }, '刷新'),
           h('button', {
             key: 'd',
-            style: css.button,
+            className: 'ml-btn',
+
             disabled: busy !== '',
             title: '把「每轮自动记录的流水」用模型整理成长期条目。会调用一次模型（消耗少量额度）',
             onClick: doDistill,
@@ -495,16 +578,16 @@ window.__ModuleLoader__.load({
         ]),
         // 显示优先级：动作的错误 > 快照读取的错误；任一存在就不显示提示语
         (state.error ?? state.snapshotError)
-          ? h('div', { key: 'err', style: { ...css.stat, color: 'var(--dsw-alias-text-error, #d33)' } },
+          ? h('div', { key: 'err', className: 'ml-err' },
               `${state.error ? '出错了：' : '读取出错：'}${state.error ?? state.snapshotError}`)
           : null,
         !(state.error ?? state.snapshotError) && state.notice
-          ? h('div', { key: 'notice', style: { ...css.stat, color: 'var(--dsw-alias-text-secondary, inherit)' } }, state.notice)
+          ? h('div', { key: 'notice', className: 'ml-ok' }, state.notice)
           : null,
         // ══ 块 3／3：列表 ═══════════════════════════════════════════════════
         state.loading
-          ? h('div', { key: 'load', style: css.stat }, '读取中…')
-          : h('div', { key: 'list', style: css.list }, shown.length
+          ? h('div', { key: 'load', className: 'ml-stat' }, '读取中…')
+          : h('div', { key: 'list', className: 'ml-list ml-scroll' }, shown.length
             // 一行一条。**用 grid 而不是 flex**（2026-10-12 改）：
             //   flex 下"长文本挤别人换行"是必然的 —— 45 条里有 40 条没有标题，回落成
             //   「正文前 24 字」长度不可控，于是 tag 被挤得自己断行，出现"有些标签占两行"。
@@ -514,10 +597,9 @@ window.__ModuleLoader__.load({
                 disabled: busy !== '',
                 onStatus: (status) => doSetStatus(e.id, status),
               }))
-            : h('div', { key: 'empty', style: css.stat }, '没有符合条件的记忆。')),
+            : h('div', { key: 'empty', className: 'ml-stat', style: { padding: '14px 2px' } }, '没有符合条件的记忆。')),
         // 构建标记：一眼判断"浏览器里跑的是哪一版面板"（见 CLIENT_BUILD 的注释）
-        h('div', { key: 'build', style: { ...css.stat, opacity: 0.35, fontSize: 11, textAlign: 'right' } },
-          `面板构建：${CLIENT_BUILD}`),
+        h('div', { key: 'build', className: 'ml-build' }, `面板构建：${CLIENT_BUILD}`),
       ]);
     }
 
@@ -530,19 +612,19 @@ window.__ModuleLoader__.load({
     function renderRow(e, index, { onStatus, disabled }) {
       return h('div', {
         key: e.id,
+        // 外观（分隔线/斑马纹/悬停高亮）在 .ml-row 里 —— 内联样式做不到 :hover，
+        // 而 47 行的大列表没有悬停高亮会很难用。这里只留**布局**（校验器要断言这些）。
+        className: 'ml-row',
         style: {
           display: 'grid',
           gridTemplateColumns: LIST_COLS,
           alignItems: 'center',
-          columnGap: 8,
-          padding: '0 10px',
+          columnGap: 10,
+          padding: '0 12px',
           height: ROW_HEIGHT,
           overflow: 'hidden',
-          border: '1px solid var(--dsw-alias-border-secondary, rgba(128,128,128,.28))',
-          borderRadius: 8,
           boxSizing: 'border-box',
-          // 斑马纹：长列表里好扫行（比全白底好认）
-          background: index % 2 ? 'rgba(128,128,128,.05)' : 'transparent',
+          flex: '0 0 auto',
         },
       }, [
         h(Tag, { key: 'l', style: { width: 52, textAlign: 'center', boxSizing: 'border-box' } },
@@ -554,8 +636,9 @@ window.__ModuleLoader__.load({
         }, e.project || '—'),
         h('span', {
           key: 't',
+          className: 'ml-title',
           title: e.title ? String(e.title) : String(e.content ?? '').slice(0, 120),
-          style: { fontSize: 13, minWidth: 0, overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' },
+          style: { minWidth: 0, overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' },
         }, e.title || String(e.content ?? '').replace(/\s+/g, ' ').slice(0, 24) || '(无标题)'),
         // 敏感单独一列（窄），不占标题的位置；没有就是空格子，列对齐不受影响
         e.sensitive
@@ -563,12 +646,13 @@ window.__ModuleLoader__.load({
           : h('span', { key: 'se' }),
         h('span', {
           key: 'used',
+          className: `ml-num${e.injectCount ? ' ml-num-on' : ''}`,
           title: e.injectCount ? `被自动注入过 ${e.injectCount} 次` : '还没被自动注入过',
-          style: { ...css.stat, textAlign: 'right', whiteSpace: 'nowrap', opacity: e.injectCount ? 0.8 : 0.35 },
         }, e.injectCount ? `${e.injectCount}×` : '–'),
         h('select', {
           key: 'st',
-          style: { ...css.input, width: '100%', minWidth: 0, padding: '2px 6px', fontSize: 12 },
+          className: 'ml-select',
+          style: { width: '100%', minWidth: 0, padding: '2px 6px', fontSize: 12 },
           value: e.status,
           disabled,
           title: '在用 = 有效且可能被召回；已完成 = 这件事做完了（内容仍有效）；已停用 = 不再被注入，但仍可搜到、可恢复',
@@ -583,6 +667,8 @@ window.__ModuleLoader__.load({
 
     /** 组件级兜底：渲染抛错时给一句可读文案，而不是整块空白 */
     function apply(ctx) {
+      // 样式表先注入（一次），再做槽位注册 —— 面板还没渲染时它就已经在页面里了
+      injectStyles();
       // ⚠ 客户端 ctx 是「按声明才给服务」的代理：**未 inject 就取属性会抛**
       //    `cannot get property "slots" without inject`（真机报错原文，2026-10-11）。
       //    所以必须先 inject 声明，再在回调给的作用域里取服务。
