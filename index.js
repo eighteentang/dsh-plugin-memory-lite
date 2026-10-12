@@ -103,6 +103,9 @@ export const apply = (ctx, rawConfig = {}) => {
     return;
   }
 
+  /** 本次 apply 真正注册成功的段落名（apply-done 日志报**事实**，不报期望） */
+  const registeredSections = [];
+
   /** 每工作区一个库（惰性打开并缓存） */
   const stores = new Map();
   const seenSeq = new Map();
@@ -354,14 +357,22 @@ export const apply = (ctx, rawConfig = {}) => {
   );
 
   // ── 3. 常驻索引段（字节稳定）────────────────────────────────────────────
+  // ⚠⚠ 必须写成 `systemPrompt.section({...})`（**属性调用**）。
+  //   框架里 `section()` 是**类方法**，内部读 `this.layers` / `this.ctx`：
+  //       section(section) { ... return this.layers.effect(this.ctx, ...) }
+  //   所以 `const section = ctx.systemPrompt.section; section({...})` 会因为 **this 丢失** 炸成
+  //       TypeError: Cannot read properties of undefined (reading 'layers')
+  //   而 `guarded` 把这个错吞了 → 表现是"段落静默没注册"（记忆索引与人设都不进提示词）。
+  //   这个错 2026-10-12 才被发现 —— 因为假 ctx 里 `section` 写成了普通函数（不用 this），
+  //   **离线 283 项全绿，真机两个段落都没注册**。假环境比真环境宽松 = 校验器在验我以为的契约。
   disposers.push(
     guarded(ctx?.logger, 'index-section', () => {
-      const section = ctx.systemPrompt?.section;
-      if (typeof section !== 'function') throw new Error('ctx.systemPrompt.section 不可用');
-      const raw = typeof ctx.systemPrompt.getSectionOrder === 'function' ? ctx.systemPrompt.getSectionOrder('TOOLS_SDK') : 4000;
+      const prompt = ctx.systemPrompt;
+      if (typeof prompt?.section !== 'function') throw new Error('ctx.systemPrompt.section 不可用');
+      const raw = typeof prompt.getSectionOrder === 'function' ? prompt.getSectionOrder('TOOLS_SDK') : 4000;
       const order = Number.isFinite(raw) ? raw : 4000;
       // 段文本按当前 agent 的工作区求值；同一组条目必须产出同一字节
-      return section({
+      const disposer = prompt.section({
         name: 'memory-lite:index',
         order,
         interpolate: false, // 防记忆正文里的 {{ }} 让组装抛异常
@@ -378,6 +389,8 @@ export const apply = (ctx, rawConfig = {}) => {
           }
         },
       });
+      registeredSections.push('memory-lite:index');
+      return disposer;
     }),
   );
 
@@ -388,15 +401,16 @@ export const apply = (ctx, rawConfig = {}) => {
   //   用自加的 `### 标题` 当锚点，于是"标题不能删"变成了对用户的约束（用户原话：不合理）。
   //   现在：内容存在插件自己的两个 .md 文件里（文件内容 = 文本框内容，零解析），
   //   段落紧跟框架的人设前缀（order + 1），保存后下一轮立刻生效。
+  // ⚠ 同上：必须**属性调用**，否则 this 丢失（这次的两个失败里就有一个是它）。
   disposers.push(
     guarded(ctx?.logger, 'persona-section', () => {
-      const section = ctx.systemPrompt?.section;
-      if (typeof section !== 'function') throw new Error('ctx.systemPrompt.section 不可用');
-      const base = typeof ctx.systemPrompt.getSectionOrder === 'function'
-        ? ctx.systemPrompt.getSectionOrder('DEPLOYMENT_PERSONA_PREFIX')
+      const prompt = ctx.systemPrompt;
+      if (typeof prompt?.section !== 'function') throw new Error('ctx.systemPrompt.section 不可用');
+      const base = typeof prompt.getSectionOrder === 'function'
+        ? prompt.getSectionOrder('DEPLOYMENT_PERSONA_PREFIX')
         : 0;
       const order = (Number.isFinite(base) ? base : 0) + 1; // 紧跟框架自己的人设段
-      return section({
+      const disposer = prompt.section({
         name: 'memory-lite:persona',
         order,
         interpolate: false, // 人设正文里可能有 {{ }}；这里不做变量插值
@@ -409,6 +423,8 @@ export const apply = (ctx, rawConfig = {}) => {
           }
         },
       });
+      registeredSections.push('memory-lite:persona');
+      return disposer;
     }),
   );
 
@@ -1014,19 +1030,13 @@ export const apply = (ctx, rawConfig = {}) => {
     }),
   );
 
-  // ── 9. 宿主侧自省对象（调试与将来的 remote 用）───────────────────────────
-  disposers.push(
-    guarded(ctx?.logger, 'introspect', () => {
-      ctx.memoryLite = {
-        config,
-        storeFor,
-        dirForWorkspace: (ws) => dirForWorkspace(ws, config.dirName),
-      };
-      return () => {
-        try { delete ctx.memoryLite; } catch { /* 忽略 */ }
-      };
-    }),
-  );
+  // ── 9. 宿主侧自省对象 ───────────────────────────────────────────────────
+  // ⚠ 2026-10-12 删掉了原来那个 `ctx.memoryLite = {...}`：cordis 的 ctx 代理**不允许**
+  //   直接给未声明的属性赋值（报 `cannot set property "memoryLite" without provide`），
+  //   正规写法是 `ctx.reflect.provide(name, value)`；而那个对象**全项目没有任何消费者**
+  //   （grep 过 dev-tools / memory-lite / EasyDSH），纯粹是"将来可能有用"的占位。
+  //   每次启动都往加载日志里写一条 FAILED —— 死代码 + 噪音，一并去掉。
+  //   真需要给诊断面板看，用 `ctx.reflect.props` 列服务名（见经验库 E64）。
 
   // ── 统一释放：注册要有 owner，卸载时全部撤掉 ────────────────────────────
   ctx.effect?.(() => () => {
@@ -1049,9 +1059,12 @@ export const apply = (ctx, rawConfig = {}) => {
   });
 
   trace(ctx?.logger, 'ready', { dirName: config.dirName, autoCapture: config.autoCapture, autoRecall: config.autoRecall, autoDistill: config.autoDistill });
+  // ⚠ 报**实际**注册了什么，不是我希望注册了什么 —— 第一版这里写死了
+  //   `sections: ['memory-lite:index','memory-lite:persona']`，于是两个段落都注册失败时
+  //   日志照样说"注册了"，我差点据此误判。日志必须报事实。
   fileLog('apply-done', {
     tools: 6,
-    sections: ['memory-lite:index', 'memory-lite:persona'],
+    sections: registeredSections,
     routes: 6,
     dirName: config.dirName,
   });
