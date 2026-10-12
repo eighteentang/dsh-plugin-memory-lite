@@ -72,7 +72,18 @@ window.__ModuleLoader__.load({
 
     /** 极简样式（只用于布局，不定义主题色 —— 颜色一律走主题 token） */
     const css = {
-      wrap: { display: 'flex', flexDirection: 'column', gap: 10, padding: '4px 0' },
+      // ⚠ 必须显式占满可用宽度 + `minWidth: 0`：面板插在宿主设置页里，如果它是某个
+      //   flex/grid 的子项，默认会**按内容收缩**；而下面列表用的是固定列宽的 grid，
+      //   容器一窄，标题列就被压到 0 → 看起来"像没有内容"（2026-10-12 用户报的现象）。
+      wrap: {
+        display: 'flex',
+        flexDirection: 'column',
+        gap: 10,
+        padding: '4px 0',
+        width: '100%',
+        minWidth: 0,
+        boxSizing: 'border-box',
+      },
       row: { display: 'flex', gap: 8, alignItems: 'center', flexWrap: 'wrap' },
       input: {
         flex: '1 1 220px',
@@ -99,12 +110,13 @@ window.__ModuleLoader__.load({
         gap: 5,
         // ⚠ 这里踩过两个坑（2026-10-12 用户报"最下面的 list 出了问题"）：
         //   ① `maxHeight: 420` 会把某一行**切一半**（420 ÷ 38 ≈ 11 行）—— 看着像坏了；
-        //      改成 60vh（行高 32 + 间距 5 = 每行 37px），但要接受"最后一行可能露一半"。
-        //      预留滚动条位置、`paddingRight` 别让滚动条压住最右的"状态"下拉。
-        //   ② 布局是"列表自己滚 + 设置页也滚"的嵌套滚动，滚轮焦点容易别扭；
-        //      所以高度给足（60vh），大多数情况不用滚。
-        maxHeight: '60vh',
+        //   ② 列表自己滚 + 设置页也滚 = 嵌套滚动。
+        // 高度用**像素**，不用 `vh`：vh 依赖视口，而面板挂在宿主的设置页里，
+        // 万一宿主给的容器高度不确定，vh 会把列表算成 0 高（表现就是"像没有内容"）。
+        maxHeight: 520,
         overflowY: 'auto',
+        overflowX: 'hidden',
+        minWidth: 0,
         paddingRight: 6,
         scrollbarGutter: 'stable',
       },
@@ -134,10 +146,12 @@ window.__ModuleLoader__.load({
 
     /**
      * 列表的列模板（每行共用一张表 → 列宽统一、行高一致）。
-     * 层级 52 · 项目 84 · 标题 自适应（minmax(0,1fr) 是省略号能生效的前提）· 敏感 30 · 用过 40 · 状态 88
-     * ⚠ 改这里只要保证**总宽不超过面板**；列多了要相应收窄，不然标题就没地方了。
+     * ⚠ **每一列都用 `minmax(0, X)`**，让它在窄面板里能收缩 ——
+     *   原来的写法（`52px 84px minmax(0,1fr) 30px 40px 88px`）里那 5 个固定列
+     *   一共 294px，容器一窄，留给标题的 1fr 就被压到 0 → "像没有内容"。
+     *   标题列必须是 `minmax(0, 1fr)`（省略号生效的前提）。
      */
-    const LIST_COLS = '52px 84px minmax(0, 1fr) 30px 40px 88px';
+    const LIST_COLS = 'minmax(0, 52px) minmax(0, 84px) minmax(0, 1fr) minmax(0, 30px) minmax(0, 40px) minmax(0, 88px)';
     /** 行高固定（像素）：所有行等高，长文本不许把行撑高 */
     const ROW_HEIGHT = 32;
 
