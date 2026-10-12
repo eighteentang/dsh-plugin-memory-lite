@@ -101,6 +101,66 @@ window.__ModuleLoader__.load({
       stat: {},
       /** 控制条：库 · 计数 · 搜索 · 状态 · 刷新 · 整理，**挤在一行** */
       bar: { display: 'flex', gap: 8, alignItems: 'center', flexWrap: 'wrap' },
+
+      /**
+       * 内联的"兜底外观"。**为什么两套都要写**（2026-10-13 的教训）：
+       *   外观本来交给注入的 `<style>` + 主题 token。但用户报"按钮还是白色"，
+       *   而我**无法从这里判断**到底是 ① 注入的 CSS 没生效（比如面板在影子 DOM 里，
+       *   `document.head` 的样式管不到），还是 ② 那个 token 运行时解析不到。
+       *   内联样式**两种情况都能生效**，所以关键外观同时内联一份：
+       *     · 情况① 时：靠内联也有颜色
+       *     · 情况② 时：兜底链最后一层是 `color-mix(currentColor …)`，绝不会变成白/透明
+       *   `<style>` 那份继续负责内联做不到的部分（`:hover` / `:focus`）。
+       */
+      look: {
+        card: {
+          background: 'var(--dsw-alias-settings-card-fill, transparent)',
+          border: '1px solid var(--dsw-alias-settings-card-stroke, transparent)',
+          borderRadius: 'var(--dsw-radius-lg, 10px)',
+          boxShadow: 'var(--dsw-shadow-lv1, none)',
+          padding: '12px 14px',
+          display: 'flex',
+          flexDirection: 'column',
+          gap: 10,
+        },
+        input: {
+          color: 'inherit',
+          background: 'var(--dsw-alias-bg-layer-1, transparent)',
+          border: '1px solid var(--dsw-alias-border-l2, transparent)',
+          borderRadius: 'var(--dsw-radius-md, 8px)',
+          padding: '5px 8px',
+        },
+        btn: {
+          color: 'inherit',
+          background: 'var(--dsw-alias-button-tool-bar-fill, transparent)',
+          border: '1px solid var(--dsw-alias-border-l2, transparent)',
+          borderRadius: 'var(--dsw-radius-md, 8px)',
+          padding: '5px 10px',
+          cursor: 'pointer',
+        },
+        btnPrimary: {
+          background: 'var(--dsw-alias-button-primary-fill, var(--dsw-alias-brand-primary, color-mix(in srgb, currentColor 14%, transparent)))',
+          color: 'var(--dsw-alias-label-primary-inverted, inherit)',
+          border: '1px solid transparent',
+          borderRadius: 'var(--dsw-radius-md, 8px)',
+          padding: '5px 10px',
+          cursor: 'pointer',
+          fontWeight: 600,
+          filter: 'brightness(.86)',
+        },
+        list: {
+          border: '1px solid var(--dsw-alias-settings-card-stroke, transparent)',
+          borderRadius: 'var(--dsw-radius-lg, 10px)',
+          background: 'var(--dsw-alias-settings-card-fill, transparent)',
+        },
+        tag: {
+          color: 'var(--dsw-alias-label-secondary, inherit)',
+          border: '1px solid var(--dsw-alias-border-l2, transparent)',
+          borderRadius: 999,
+          padding: '1px 7px',
+          background: 'color-mix(in srgb, var(--dsw-alias-bg-layer-2, currentColor) 55%, transparent)',
+        },
+      },
     };
 
     /**
@@ -118,8 +178,9 @@ window.__ModuleLoader__.load({
       return h('span', {
         title,
         // 外观在 CSS 类里（.ml-tag / .ml-tag-level / .ml-tag-warn），这里只留"不许换行"
+        // + 一份内联兜底（见 css.look 的注释：无法确认注入的 CSS 一定生效）
         className: `ml-tag${warn ? ' ml-tag-warn' : ''}`,
-        style: { ...css.tag, ...(style ?? null) },
+        style: { ...css.tag, ...css.look.tag, ...(style ?? null) },
       }, children);
     }
 
@@ -134,7 +195,7 @@ window.__ModuleLoader__.load({
      * 也可能是宿主没重启）。面板底部显示这个字符串，一眼就能判定：
      *   看到的值 = 我刚改的值 → 新代码在跑；看到旧值 → 强制刷新（Ctrl+Shift+R）
      */
-    const CLIENT_BUILD = '按钮深一档 · 1013b';
+    const CLIENT_BUILD = '按钮兜底+内联 · 1013c';
 
     /**
      * 样式表（一次性注入）。为什么用 `<style>` 而不是全内联：
@@ -198,15 +259,22 @@ textarea.ml-input { line-height: 1.65; resize: vertical; }
 .ml-btn:hover:not(:disabled) { background: var(--dsw-alias-button-tool-bar-hover); }
 .ml-btn:disabled { opacity: .45; cursor: not-allowed; }
 .ml-btn-primary {
-  /* 用户反馈"点进去有点刺眼、按钮换个稍深点的"（2026-10-13）：
-     静止态直接用设计系统里**深一档**的那个 token（-hover 就是比 -fill 深的那一档），
-     悬停再用 brightness 微调，不再叠一层更亮的颜色。
-     这样既满足"深一点"，又不用我自己调色（自己调色 = 脱离主题、深浅模式会崩）。 */
-  background: var(--dsw-alias-button-primary-hover);
-  color: var(--dsw-alias-label-primary-inverted);
+  /* ⚠ 这里踩了一个坑（2026-10-13，用户报"还是白色"）：
+     我为了"深一档"把底色换成 --dsw-alias-button-primary-hover —— 这个 token 在 asar 的
+     token 清单里**存在**，但**运行时解析不到** → background 的 var() 失效 → 退回透明
+     → 白底卡片上看着就是白的。（换成 -fill 时用户看到的是"刺眼"亮色 → 那个能解析。）
+     两条结论：
+       ①「在清单里存在」≠「这个子树能解析到」—— 存在性校验挡不住这种失效；
+       ② 用 token 一定**留兜底**，最后一层兜底绝不留成白/透明。
+     现在：底色用能解析的 -fill，靠 filter: brightness 压暗（同色相、不自己调色）。 */
+  background: var(--dsw-alias-button-primary-fill,
+    var(--dsw-alias-brand-primary,
+    color-mix(in srgb, currentColor 14%, transparent)));
+  color: var(--dsw-alias-label-primary-inverted, inherit);
   border-color: transparent; font-weight: 600;
+  filter: brightness(.86);
 }
-.ml-btn-primary:hover:not(:disabled) { filter: brightness(.95); }
+.ml-btn-primary:hover:not(:disabled) { filter: brightness(.78); }
 .ml-bar { display: flex; align-items: center; gap: 8px; flex-wrap: wrap; }
 .ml-stat { font-size: 12px; color: var(--dsw-alias-label-secondary); white-space: nowrap; }
 .ml-list {
@@ -490,7 +558,7 @@ textarea.ml-input { line-height: 1.65; resize: vertical; }
           h('textarea', {
             key: 'ta',
             className: 'ml-input',
-            style: { minHeight, width: '100%', fontFamily: 'inherit' },
+            style: { ...css.look.input, minHeight, width: '100%', fontFamily: 'inherit' },
             placeholder: '想写什么就写什么，没有任何格式要求（不用标题、不用 markdown）。',
             value: draft[slot],
             disabled: persona?.ok === false,
@@ -501,11 +569,12 @@ textarea.ml-input { line-height: 1.65; resize: vertical; }
               key: 's',
               // 保存是主要操作 → 用主按钮样式（其余是次按钮）
               className: 'ml-btn ml-btn-primary',
+              style: css.look.btnPrimary,
               disabled: cant,
               onClick: () => savePersona(slot),
             }, busyHere ? '保存中…' : buttonLabel),
             slot === 'rules'
-              ? h('button', { key: 'r', className: 'ml-btn', disabled: personaBusy !== '', onClick: loadPersona }, '重新读取')
+              ? h('button', { key: 'r', className: 'ml-btn', style: css.look.btn, disabled: personaBusy !== '', onClick: loadPersona }, '重新读取')
               : null,
             h('span', { key: 'hint', className: 'ml-stat' }, slot === 'persona'
               ? '保存时会先备份；文本框里写什么，文件里就是什么'
@@ -524,7 +593,7 @@ textarea.ml-input { line-height: 1.65; resize: vertical; }
         // ══ 块 1／3：人设与行为准则（两个文本框，**每个框各一个保存按钮**）══════
         // 用户明确要求："人设与行为准则这里记得加上保存按钮" —— 重排时不能把按钮画没了。
         // 每个框一个按钮（而不是一个"全部保存"）：两块是独立的两件事，改哪块存哪块。
-        h('div', { key: 'persona', className: 'ml-card' }, [
+        h('div', { key: 'persona', className: 'ml-card', style: css.look.card }, [
           h('div', { key: 'h', className: 'ml-h' }, [
             h('strong', { key: 't' }, '人设与行为准则'),
             h('span', { key: 'f' }, persona?.dir ? `文件：${persona.dir}` : '每轮自动带进提示词'),
@@ -544,7 +613,7 @@ textarea.ml-input { line-height: 1.65; resize: vertical; }
                 key: 'store',
                 className: 'ml-select',
                 title: currentStore?.dbPath ? `库文件：${currentStore.dbPath}` : '记忆库',
-                style: { flex: '0 0 auto', maxWidth: 240 },
+                style: { ...css.look.input, flex: '0 0 auto', maxWidth: 240 },
                 value: String(state.active),
                 onChange: (e) => setState((s) => ({ ...s, active: Number(e.target.value) })),
               }, state.stores.map((s, i) => h('option', { key: `st${i}`, value: String(i) },
@@ -559,7 +628,7 @@ textarea.ml-input { line-height: 1.65; resize: vertical; }
           h('input', {
             key: 'q',
             className: 'ml-input',
-            style: { flex: '0 1 240px', minWidth: 120 },
+            style: { ...css.look.input, flex: '0 1 240px', minWidth: 120 },
             placeholder: '搜索标题 / 正文 / 关键词',
             value: query,
             onChange: (e) => setQuery(e.target.value),
@@ -567,7 +636,7 @@ textarea.ml-input { line-height: 1.65; resize: vertical; }
           h('select', {
             key: 's',
             className: 'ml-select',
-            style: { flex: '0 0 auto' },
+            style: { ...css.look.input, flex: '0 0 auto' },
             title: '在用 = 有效且可能被召回；已完成 = 这件事做完了（内容仍有效）；已停用 = 不再被注入，但仍可搜到、可恢复',
             value: statusFilter,
             onChange: (e) => setStatusFilter(e.target.value),
@@ -577,11 +646,11 @@ textarea.ml-input { line-height: 1.65; resize: vertical; }
             h('option', { key: 'x', value: 'archived' }, '已停用（可恢复）'),
             h('option', { key: 'all', value: 'all' }, '全部'),
           ]),
-          h('button', { key: 'r', className: 'ml-btn', onClick: reload, disabled: state.loading || busy !== '' }, '刷新'),
+          h('button', { key: 'r', className: 'ml-btn', style: css.look.btn, onClick: reload, disabled: state.loading || busy !== '' }, '刷新'),
           h('button', {
             key: 'd',
             className: 'ml-btn',
-
+            style: css.look.btn,
             disabled: busy !== '',
             title: '把「每轮自动记录的流水」用模型整理成长期条目。会调用一次模型（消耗少量额度）',
             onClick: doDistill,
@@ -598,7 +667,7 @@ textarea.ml-input { line-height: 1.65; resize: vertical; }
         // ══ 块 3／3：列表 ═══════════════════════════════════════════════════
         state.loading
           ? h('div', { key: 'load', className: 'ml-stat' }, '读取中…')
-          : h('div', { key: 'list', className: 'ml-list ml-scroll' }, shown.length
+          : h('div', { key: 'list', className: 'ml-list ml-scroll', style: css.look.list }, shown.length
             // 一行一条。**用 grid 而不是 flex**（2026-10-12 改）：
             //   flex 下"长文本挤别人换行"是必然的 —— 45 条里有 40 条没有标题，回落成
             //   「正文前 24 字」长度不可控，于是 tag 被挤得自己断行，出现"有些标签占两行"。
