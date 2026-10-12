@@ -175,6 +175,16 @@ window.__ModuleLoader__.load({
     /** 与宿主路由约定的前缀（改这里必须同时改 index.js 的 API_PREFIX） */
     const API = '/dsh-memory-lite/api';
 
+    /**
+     * 面板构建标记 —— **改这个文件就顺手更新它**。
+     *
+     * 为什么需要（2026-10-12 的真实困扰）：改完面板、用户刷新后说"没什么变化"，
+     * 而**双方都无法判断浏览器里跑的是哪一版**（可能是页面没真刷新、可能是浏览器缓存、
+     * 也可能是宿主没重启）。面板底部显示这个字符串，一眼就能判定：
+     *   看到的值 = 我刚改的值 → 新代码在跑；看到旧值 → 强制刷新（Ctrl+Shift+R）
+     */
+    const CLIENT_BUILD = '3块布局 · 1013';
+
     /** 同源请求宿主路由。为什么不用官方 remote：RPC 需要 TypertRemoteService 基类，解析不到。 */
     async function api(path, body) {
       const init = body === undefined
@@ -505,6 +515,9 @@ window.__ModuleLoader__.load({
                 onStatus: (status) => doSetStatus(e.id, status),
               }))
             : h('div', { key: 'empty', style: css.stat }, '没有符合条件的记忆。')),
+        // 构建标记：一眼判断"浏览器里跑的是哪一版面板"（见 CLIENT_BUILD 的注释）
+        h('div', { key: 'build', style: { ...css.stat, opacity: 0.35, fontSize: 11, textAlign: 'right' } },
+          `面板构建：${CLIENT_BUILD}`),
       ]);
     }
 
