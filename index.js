@@ -1054,8 +1054,21 @@ export const apply = (ctx, rawConfig = {}) => {
         /* 忽略 */
       }
     }
+    // ⚠ 必须先把每个库**关掉**再清 Map（2026-10-12 修）。
+    //   原来只有 `stores.clear()` —— Map 清空了，SQLite 连接还开着：
+    //   Windows 上句柄不释放，临时目录删不掉（校验器尾部 rmSync 报 EPERM），
+    //   插件热重载时也会一次次泄漏连接。判据：**close() 不是可选的**。
+    let closed = 0;
+    for (const memory of stores.values()) {
+      try {
+        memory?.close?.();
+        closed += 1;
+      } catch {
+        /* 已关闭或关不掉都不该影响卸载 */
+      }
+    }
     stores.clear();
-    trace(ctx?.logger, 'disposed');
+    trace(ctx?.logger, 'disposed', { storesClosed: closed });
   });
 
   trace(ctx?.logger, 'ready', { dirName: config.dirName, autoCapture: config.autoCapture, autoRecall: config.autoRecall, autoDistill: config.autoDistill });
