@@ -18,6 +18,17 @@ build/
 .dsh-memory/
 .dsh-meow/
 
+# 运行时数据（评测/校验脚本在工作目录里写出来的）—— 2026-10-13 补
+# 起因：跑评测脚本时它在仓库根写出了 mem/memory.db（172 KB，真记忆库）与
+# archive/log-sess-B.jsonl。这类文件**绝不能进仓库**：记忆库是私有数据，
+# 而且 `git add -A` 会顺带把它提交上去（那次就是这么被 staged 的）。
+# 判据：凡是"插件运行时生成的数据"都归这一节，别靠记得别 add。
+mem/
+archive/
+*.db
+*.db-wal
+*.db-shm
+
 # 系统杂物
 .DS_Store
 Thumbs.db
