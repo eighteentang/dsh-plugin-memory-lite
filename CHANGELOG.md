@@ -8,8 +8,74 @@
 **怎么钉版本**（避免"装到一半上游改了"）：
 
 ```sh
-dsh plugin --profile <你的profile名> add github:eighteentang/dsh-plugin-memory-lite#v1.7.0
+dsh plugin --profile <你的profile名> add github:eighteentang/dsh-plugin-memory-lite#v1.8.0
 ```
+
+---
+
+## [1.8.0] - 2026-10-13
+
+### 新增：备份/恢复 + 迁移前备份**闸门**（阻塞式）
+
+原来迁移前的那次备份是 `void backupBeforeMigration(...)` —— **既不阻塞、也无声**：
+备份失败了迁移照样跑。而此刻正要迁移的库，恰恰是"迁移出问题就回不去"的那个。
+
+- **`lib/backup.js`（新模块）**：创建备份（SQLite `VACUUM INTO` 语义，失败不留 `.partial` 半成品）、
+  校验备份文件、列出备份、保留数量轮转（默认 7）、恢复（就地/指定目录，`force` 需显式）。
+- **闸门**：迁移前**同步**执行备份；**备份失败 = 拦住迁移**（`openMemory-BLOCKED-no-backup`），
+  并写 `pre-migration-backup {ok:false, reason}` 到加载日志。
+  `autoBackup !== true` 时闸门放行，但**记下原因**（用户显式选择不备份 ≠ 静默跳过）。
+- 备份目录默认 `$DSH_HOME/memory-lite/backups/`，日志 `$DSH_HOME/memory-lite/backup.log`。
+
+### 修复：脱敏漏了两类凭据 —— 而敏感分类器正好依赖它
+
+敏感分类从"关键词猜"改成**看精确信号**：写入时 `redactSecrets` 会把真凭据换成
+`[REDACTED:xxx]`，正文里出现这个标记 = **真的含过**凭据（比"提到密钥这个词"准得多）。
+暴露出的问题是：分类器依赖写入侧先脱敏，**写入侧漏了，分类器就跟着漏**。
+
+验收实测漏报的两类，已补进 `SECRET_PATTERNS`：
+
+- **PEM 私钥块**（`-----BEGIN ... PRIVATE KEY-----`）—— 原来一条都拦不住；
+- **截断的私钥**（只有 BEGIN 头，复制一半/日志被截/模型输出被切）—— 半个私钥照样是秘密；
+- 另补 `password: xxx` 这类**无特征前缀**的赋值写法。
+
+**判据**：脱敏是分类的前置条件，两者必须覆盖**同一批形态**。
+
+### 新增：检索算法版本号 + 反馈闭环接线
+
+- `RECALL_ALGO_VERSION = 'v4.1'`（`lib/config.js`）：**任何会改变召回结果的改动都要 +1**。
+  没有它，反馈数据只能笼统堆在一起，而检索改过之后旧反馈的含义已经变了。
+- 反馈能关联到**具体记忆与排序**（`index.js` 接线），这是"用真实使用效果评判检索改动"的前提。
+
+### 实测（A/B 对照，59 例固定测试集，跑在库快照上）
+
+| 指标 | 前 | 后 |
+|---|---|---|
+| precision@3 | 0.177 | **0.287** |
+| recall@3 | 0.407 | **0.500** |
+| MRR | 0.409 | **0.494** |
+| 不相关注入率 | 0.823 | **0.713** |
+| 负样本泄漏率 | 0.688 | **0.375** |
+| 平均候选 / 平均注入 | 5.29 / 2.10 | **3.22 / 1.59** |
+| 敏感泄漏（9 例） | 0 | 0 |
+
+**⚠ 口径提醒**：`zeroHitRate` 0.102 → 0.203 看着像变差，其实是把两类混在一个数里了 ——
+**负样本**零命中 5/16 → **10/16（好事：不再乱注入）**，**正样本**零命中 1/43 → **2/43（真差 1 条）**。
+别用这个聚合数下结论。
+
+### 界面（记忆控制面板）
+
+- 重排成 **3 块**：人设与规范（每人设一个保存按钮）· 一行控制条 · 列表。
+- 视觉全部走 **DSH 主题 token**（0 个硬编码色值，深浅主题自动跟随）；
+  列表从"每行一个描边卡片"改成"一个容器 + 发丝分隔线 + 斑马纹 + 悬停高亮"。
+- 构建标记仍在（控制台一行 + 根元素 `data-build`，界面上不再占位）。
+
+### 校验器
+
+- 常规套件 **319 项**（`tools/verify/`），本轮新增/加强 **150 项**验收（`tools/eval/`，
+  不进仓库）：备份恢复、恢复失败路径、迁移闸门、敏感安全、修复验收、面板渲染。
+- **注意**：断言全绿 ≠ 验收完成。备份/恢复目前只有**脚本级**验证，
+  **还没在真机上恢复过一次真实库**。
 
 ---
 
@@ -358,3 +424,4 @@ dsh plugin --profile <你的profile名> add github:eighteentang/dsh-plugin-memor
 [1.5.0]: https://github.com/eighteentang/dsh-plugin-memory-lite/releases/tag/v1.5.0
 [1.6.0]: https://github.com/eighteentang/dsh-plugin-memory-lite/releases/tag/v1.6.0
 [1.7.0]: https://github.com/eighteentang/dsh-plugin-memory-lite/releases/tag/v1.7.0
+[1.8.0]: https://github.com/eighteentang/dsh-plugin-memory-lite/releases/tag/v1.8.0
