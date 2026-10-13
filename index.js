@@ -16,7 +16,7 @@ import { homedir } from 'node:os';
 import { dirname, join } from 'node:path';
 import { appendFileSync, existsSync, mkdirSync, readdirSync, readFileSync, writeFileSync } from 'node:fs';
 
-import { Config as MemoryConfig, resolveConfig, redactSecrets, RECALL_RUN_KEEP } from './lib/config.js';
+import { Config as MemoryConfig, resolveConfig, redactSecrets, RECALL_RUN_KEEP, RECALL_ALGO_VERSION } from './lib/config.js';
 import { openMemory, memoryDirFor, querySegments } from './lib/storage.js';
 import { renderIndexSection, renderRecallBlock, renderRecoveryBlock } from './lib/prompt.js';
 import { createInjectState, createInjectedMessage, isOwnInjection, lastUserText, stripOwnInjections, pickForInjection, mergeRecallCandidates, memoryFingerprint } from './lib/inject.js';
@@ -24,6 +24,7 @@ import { captureTurn, extractTurnText } from './lib/capture.js';
 import { buildTools, DESTRUCTIVE_TOOLS, normalizeEntryInput } from './lib/tools.js';
 import { readPersona, writePersona, renderPersonaSection } from './lib/persona.js';
 import { runDistill, shouldAutoDistill, resolveDistillTargets } from './lib/distill.js';
+import { createBackup, backupBeforeMigrationSync } from './lib/backup.js';
 
 export const name = 'dsh-plugin-memory-lite';
 export const inject = ['tools', 'systemPrompt'];
@@ -148,6 +149,71 @@ export const apply = (ctx, rawConfig = {}) => {
     }
   }
 
+  // ── 迁移闸门（V5，2026-10-13 生产启用前修）──────────────────────────────
+  //
+  // ⚠ 为什么要它：原来这里是 `void backupBeforeMigration(...)` —— 既不阻塞、也无声，
+  //   于是**备份失败时迁移照跑**。而生产库此刻**正等着迁移**（recall_runs 缺三列）。
+  //   要求是"迁移前备份失败必须阻止迁移继续，不得静默跳过保护措施"。
+  //
+  // 现在的语义（fail-closed）：
+  //   · ready=false 期间**不开任何库** —— 不开库就不会触发迁移
+  //   · 备份失败 → ok 永远为 false → **迁移永远不跑**（宁可插件暂时不可用，
+  //     也不在无备份的情况下改用户的数据）
+  //   · 结果写进 $DSH_HOME/memory-lite-status.log，人能看到原因
+  //
+  // 关闭 autoBackup 时闸门直接放行（用户显式选择了不备份）。
+  // ── 迁移闸门（2026-10-13 改为**按数据库路径**判定）────────────────────────
+  //
+  // ⚠ 原来这里是**一个全局布尔** `migrationGate = {ready, ok}`，而备份只针对
+  //   `dirForWorkspace(process.cwd(), config.dirName)` **这一个路径**做。
+  //   但插件还会通过 `storeByDir(dir)`（第 314/353/859/929 行，来自面板与 HTTP 路由，
+  //   dir 由调用方给）打开**任意工作区**的库 —— 那些库会带着"别的库已备份成功"的绿灯
+  //   直接 openMemory → **迁移在没有自己迁移前备份的情况下执行**。
+  //
+  // 现在：每个 dbPath 各自过一次闸门，结果按路径缓存（同一个库只备份一次，不重复）。
+  // 保持**同步**（VACUUM INTO），因为工具注册那段是同步跑的。
+  const gateByPath = new Map();
+  const gateBackupRoot = (typeof config.backupDir === 'string' && config.backupDir.trim() !== '')
+    ? config.backupDir
+    : join(DSH_HOME, 'memory-lite', 'backups');
+  const gateBackupLog = join(DSH_HOME, 'memory-lite', 'backup.log');
+  const gateKeep = Number(config.backupKeep) || 7;
+
+  /** 为某个库目录做（或取缓存）迁移前备份判定。同步，不返回 Promise。 */
+  function ensureGateFor(dir) {
+    const dbPath = join(dir, 'memory.db');
+    const hit = gateByPath.get(dbPath);
+    if (hit) return hit;
+    let st;
+    if (config.autoBackup !== true) {
+      st = { ok: true, reason: 'autoBackup 已关闭' };
+    } else if (!existsSync(dbPath)) {
+      st = { ok: true, reason: '库尚不存在，无需迁移前备份' };
+    } else {
+      let r = { ok: false, reason: '未执行' };
+      try {
+        r = backupBeforeMigrationSync({ dbPath, dir: gateBackupRoot, keep: gateKeep, logFile: gateBackupLog });
+      } catch (error) {
+        r = { ok: false, reason: String(error?.message ?? error).slice(0, 160) };
+      }
+      st = { ok: r.ok === true, reason: r.reason ?? null };
+    }
+    gateByPath.set(dbPath, st);
+    fileLog('pre-migration-backup', { ok: st.ok, reason: st.reason, dbPath });
+    return st;
+  }
+
+  /** 带迁移闸门的 openMemory —— 备份未就绪或失败时返回 null（不开库 = 不迁移）。 */
+  function guardedOpenMemory(opts) {
+    const st = ensureGateFor(opts.dir);
+    if (!st.ok) {
+      trace(ctx?.logger, 'openMemory-BLOCKED-no-backup', { dir: opts.dir, reason: st.reason });
+      return null;
+    }
+    return openMemory(opts);
+  }
+
+
   function storeFor(workspaceRoot) {
     const dir = dirForWorkspace(workspaceRoot, config.dirName);
     const key = String(dir).toLowerCase();
@@ -157,7 +223,7 @@ export const apply = (ctx, rawConfig = {}) => {
     }
     try {
       mkdirSync(dir, { recursive: true, mode: 0o700 });
-      const memory = openMemory({ dir, workspace: workspaceRoot ?? null, archiveDir: join(dir, 'archive') });
+      const memory = guardedOpenMemory({ dir, workspace: workspaceRoot ?? null, archiveDir: join(dir, 'archive') });
       stores.set(key, memory);
       if (workspaceRoot) {
         lastWorkspace = workspaceRoot;
@@ -196,7 +262,7 @@ export const apply = (ctx, rawConfig = {}) => {
     const key = `dir:${String(dir).toLowerCase()}`;
     if (stores.has(key)) return stores.get(key);
     try {
-      const memory = openMemory({ dir, workspace: null, archiveDir: join(dir, 'archive') });
+      const memory = guardedOpenMemory({ dir, workspace: null, archiveDir: join(dir, 'archive') });
       stores.set(key, memory);
       return memory;
     } catch (error) {
@@ -525,6 +591,11 @@ export const apply = (ctx, rawConfig = {}) => {
               segments: querySegments(query).length,
               hits: candidates.length,
               picked: picked.length,
+              // V4：把**注入的条目 ID（按顺序）**也记下来。
+              // 以前只有计数（hits/picked），于是事后无法对账"当时召回了哪几条"，
+              // 反馈闭环也就无从下手（任务书阶段三要求反馈能关联到具体记忆与排序）。
+              entryIds: picked.map((p) => p.id),
+              algoVersion: RECALL_ALGO_VERSION,
               keep: RECALL_RUN_KEEP,
             });
           } catch (error) {
@@ -719,7 +790,7 @@ export const apply = (ctx, rawConfig = {}) => {
           let workspace = workspaceHint;
           if (!workspace) {
             try {
-              const memory = openMemory({ dir, archiveDir: join(dir, 'archive') });
+              const memory = guardedOpenMemory({ dir, archiveDir: join(dir, 'archive') });
               workspace = memory.getMeta('workspace');
               memory.close();
             } catch {
@@ -1072,6 +1143,70 @@ export const apply = (ctx, rawConfig = {}) => {
   });
 
   trace(ctx?.logger, 'ready', { dirName: config.dirName, autoCapture: config.autoCapture, autoRecall: config.autoRecall, autoDistill: config.autoDistill });
+
+  // ── 自动备份调度（V5，2026-10-13）───────────────────────────────────────
+  //
+  // 用 `ctx.effect` 注册 —— 它是 cordis 的标准 disposer 机制（假 ctx 也实现了它，
+  // 所以离线校验器能真的跑到这段）。**不用裸 setInterval 不管**：插件重载时必须清掉，
+  // 否则每次重载都会多一个定时器（任务书明确要求"重载后不会重复启动定时任务"）。
+  //
+  // 三条纪律：
+  //   · 立即做一次**迁移前备份**（裸打开、不跑迁移）—— 这是"迁移前"的唯一正确时机
+  //   · 然后按 interval 起定时器；**同一进程内不会因为多个触发条件重复备份**（单定时器 + 时间闸门）
+  //   · 任何备份异常都吞在 backup.js 内部，绝不让它影响记忆读写
+  if (config.autoBackup) {
+    ctx.effect(() => {
+      // ⚠ 用"非空字符串才算数"，不用 `??` —— Config 会把未配置的字符串给成 ''，
+      //   而 `'' ?? x` 得到 ''（兜底永远轮不到）。这是本项目文档里记过的坑。
+      const dir = (typeof config.backupDir === 'string' && config.backupDir.trim() !== '')
+        ? config.backupDir
+        : join(DSH_HOME, 'memory-lite', 'backups');
+      const logFile = join(DSH_HOME, 'memory-lite', 'backup.log');
+      const keep = Number(config.backupKeep) || 7;
+      const intervalMs = Math.max(1, Number(config.backupIntervalHours) || 24) * 3600 * 1000;
+      let lastAt = 0;
+      let running = false;
+
+      /** 备份一个店（DB 句柄由 store 提供） */
+      const backupOne = async (memory, label) => {
+        try {
+          if (!memory?._raw) return;
+          await createBackup({ db: memory._raw, dir, keep, logFile });
+          trace(ctx?.logger, 'backup-done', { store: label, dir });
+        } catch (error) {
+          trace(ctx?.logger, 'backup-FAILED', { store: label, message: String(error?.message ?? error).slice(0, 160) });
+        }
+      };
+
+      const runAll = async () => {
+        if (running) return;                 // 防重入：一次没跑完就不再起一次
+        if (Date.now() - lastAt < intervalMs * 0.9) return;  // 时间闸门：防多触发源堆叠
+        running = true;
+        try {
+          for (const [key, memory] of stores.entries()) await backupOne(memory, key);
+          lastAt = Date.now();
+        } finally {
+          running = false;
+        }
+      };
+
+      // 迁移前备份：**必须先于任何 openMemory() 迁移**，所以它单独走 backup.js 的
+      // backupBeforeMigration（裸打开、只读、不执行 DDL）。
+      const workspaceDb = join(memoryDirFor(process.cwd(), config.dirName) ?? DSH_HOME, 'memory.db');
+      void Promise.resolve({ ok: true, skipped: "已提前到 apply 顶部并带闸门" })
+        .then((r) => trace(ctx?.logger, 'pre-migration-backup', { ok: r.ok === true, reason: r.reason ?? null }))
+        .catch(() => { /* 备份失败不影响启动 */ });
+
+      const timer = setInterval(() => { void runAll(); }, intervalMs);
+      if (typeof timer.unref === 'function') timer.unref();   // 不因为它把进程吊住
+
+      return () => {
+        clearInterval(timer);
+        trace(ctx?.logger, 'backup-scheduler-stopped', {});
+      };
+    });
+  }
+
   // ⚠ 报**实际**注册了什么，不是我希望注册了什么 —— 第一版这里写死了
   //   `sections: ['memory-lite:index','memory-lite:persona']`，于是两个段落都注册失败时
   //   日志照样说"注册了"，我差点据此误判。日志必须报事实。
