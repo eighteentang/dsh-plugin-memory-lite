@@ -17,9 +17,9 @@ import { dirname, join } from 'node:path';
 import { appendFileSync, existsSync, mkdirSync, readdirSync, readFileSync, writeFileSync } from 'node:fs';
 
 import { Config as MemoryConfig, resolveConfig, redactSecrets, RECALL_RUN_KEEP, RECALL_ALGO_VERSION } from './lib/config.js';
-import { openMemory, memoryDirFor, querySegments } from './lib/storage.js';
+import { openMemory, memoryDirFor, querySegments, schemaNeedsMigration } from './lib/storage.js';
 import { renderIndexSection, renderRecallBlock, renderRecoveryBlock } from './lib/prompt.js';
-import { createInjectState, createInjectedMessage, isOwnInjection, lastUserText, stripOwnInjections, pickForInjection, mergeRecallCandidates, memoryFingerprint } from './lib/inject.js';
+import { createInjectState, createInjectedMessage, isOwnInjection, lastUserMessage, textOf, stripOwnInjections, pickForInjection, mergeRecallCandidates, memoryFingerprint } from './lib/inject.js';
 import { captureTurn, extractTurnText } from './lib/capture.js';
 import { buildTools, DESTRUCTIVE_TOOLS, normalizeEntryInput } from './lib/tools.js';
 import { readPersona, writePersona, renderPersonaSection } from './lib/persona.js';
@@ -109,8 +109,27 @@ export const apply = (ctx, rawConfig = {}) => {
 
   /** 每工作区一个库（惰性打开并缓存） */
   const stores = new Map();
+  /**
+   * 打开失败的库 → 失败时间。
+   *
+   * 旧实现把 `null` 也缓存进 `stores`，于是**一次瞬态失败（比如迁移闸门刚好在备份）
+   * 会让这个工作区的记忆功能停到进程重启**。现在失败后只冷却 60 秒再重试：
+   * 既不每轮撞同一堵墙，也不会把一次失败当成永久结论。
+   */
+  const failedStores = new Map();
+  const FAILED_RETRY_MS = 60 * 1000;
+  /** 已经写进注册表的库目录（避免每次打开都重写 workspaces.json） */
+  const remembered = new Set();
   const seenSeq = new Map();
   const injectState = createInjectState();
+  /**
+   * 每个会话「最近一次已召回的 query 键」。
+   *
+   * `agent/pre-step` 是**每次模型调用**触发（实测一个 11 轮的会话有 74 个 step），
+   * 而用户消息在整个回合里不变 —— 不拦的话会：①同一句 query 被反复全表扫描；
+   * ②recall_runs 灌进大量重复样本；③hit_count 虚高。一个回合只召回一次。
+   */
+  const recallGuard = new Map();
   /** 最近一次被 agent 解析到的工作区 —— 面板没有 agent 上下文时的一个兜底 */
   let lastWorkspace = null;
 
@@ -178,6 +197,7 @@ export const apply = (ctx, rawConfig = {}) => {
     : join(DSH_HOME, 'memory-lite', 'backups');
   const gateBackupLog = join(DSH_HOME, 'memory-lite', 'backup.log');
   const gateKeep = Number(config.backupKeep) || 7;
+  const gateMigrationKeep = Number(config.backupMigrationKeep) || 3;
 
   /** 为某个库目录做（或取缓存）迁移前备份判定。同步，不返回 Promise。 */
   function ensureGateFor(dir) {
@@ -190,13 +210,31 @@ export const apply = (ctx, rawConfig = {}) => {
     } else if (!existsSync(dbPath)) {
       st = { ok: true, reason: '库尚不存在，无需迁移前备份' };
     } else {
-      let r = { ok: false, reason: '未执行' };
-      try {
-        r = backupBeforeMigrationSync({ dbPath, dir: gateBackupRoot, keep: gateKeep, logFile: gateBackupLog });
-      } catch (error) {
-        r = { ok: false, reason: String(error?.message ?? error).slice(0, 160) };
+      // ⚠ 2026-11-07：只在**真的会迁移**时才备份。
+      //   旧实现只要库文件存在就备份 —— 每次进程启动、每个库一份**同步** VACUUM INTO，
+      //   而本机 7 个库的 schema 都已是最新、根本没有迁移要做。库一大，启动就被拖住；
+      //   这类备份原来又不参与清理，份数随重启线性增长（已单独设上限）。
+      const probe = schemaNeedsMigration(dbPath);
+      if (probe.ok && !probe.needs) {
+        st = { ok: true, reason: '结构已是最新，无需迁移前备份', version: probe.version };
+      } else {
+        let r = { ok: false, reason: '未执行' };
+        try {
+          r = backupBeforeMigrationSync({
+            dbPath,
+            dir: gateBackupRoot,
+            keep: gateKeep,
+            migrationKeep: gateMigrationKeep,
+            logFile: gateBackupLog,
+          });
+        } catch (error) {
+          r = { ok: false, reason: String(error?.message ?? error).slice(0, 160) };
+        }
+        st = {
+          ok: r.ok === true,
+          reason: r.reason ?? (probe.ok ? null : `结构探测失败：${probe.reason ?? '未知'}`),
+        };
       }
-      st = { ok: r.ok === true, reason: r.reason ?? null };
     }
     gateByPath.set(dbPath, st);
     fileLog('pre-migration-backup', { ok: st.ok, reason: st.reason, dbPath });
@@ -214,29 +252,51 @@ export const apply = (ctx, rawConfig = {}) => {
   }
 
 
-  function storeFor(workspaceRoot) {
-    const dir = dirForWorkspace(workspaceRoot, config.dirName);
+  /**
+   * 打开/复用某个目录的记忆库（带失败冷却）。
+   *
+   * 缓存键就是目录本身（**不带前缀**）：同一个目录只能有一个 SQLite 句柄。
+   * 旧实现 `storeFor` 用裸路径、`storeByDir` 用 `dir:` 前缀 → 同一个库会被打开成
+   * 两个连接（面板列库 + 召回同时发生时），Windows 上更容易撞 WAL 锁。
+   */
+  function cachedOpen(dir, workspace = null) {
     const key = String(dir).toLowerCase();
-    if (stores.has(key)) {
-      if (workspaceRoot) lastWorkspace = workspaceRoot;
-      return stores.get(key);
-    }
+    if (stores.has(key)) return stores.get(key);
+    const failedAt = failedStores.get(key);
+    if (failedAt && Date.now() - failedAt < FAILED_RETRY_MS) return null;
     try {
       mkdirSync(dir, { recursive: true, mode: 0o700 });
-      const memory = guardedOpenMemory({ dir, workspace: workspaceRoot ?? null, archiveDir: join(dir, 'archive') });
-      stores.set(key, memory);
-      if (workspaceRoot) {
-        lastWorkspace = workspaceRoot;
-        // 只登记真正的工作区库；`storeFor(null)` 的 global 回退库不登记，
-        // 否则注册表里会出现一个 workspace=null 的条目，在面板里看着像"工作区"
-        rememberStore(dir, workspaceRoot);
+      const memory = guardedOpenMemory({ dir, workspace, archiveDir: join(dir, 'archive') });
+      if (!memory) {
+        failedStores.set(key, Date.now());
+        return null;
       }
+      stores.set(key, memory);
+      failedStores.delete(key);
       trace(ctx?.logger, 'store-opened', { dir });
       return memory;
     } catch (error) {
+      failedStores.set(key, Date.now());
       trace(ctx?.logger, 'store-open-FAILED', { dir, message: String(error?.message ?? error).slice(0, 200) });
       return null;
     }
+  }
+
+  function storeFor(workspaceRoot) {
+    const dir = dirForWorkspace(workspaceRoot, config.dirName);
+    const memory = cachedOpen(dir, workspaceRoot ?? null);
+    if (memory && workspaceRoot) {
+      lastWorkspace = workspaceRoot;
+      const key = String(dir).toLowerCase();
+      if (!remembered.has(key)) {
+        remembered.add(key);
+        // 只登记真正的工作区库；`storeFor(null)` 的 global 回退库不登记，
+        // 否则注册表里会出现一个 workspace=null 的条目，在面板里看着像"工作区"
+        try { memory.setMeta?.('workspace', workspaceRoot); } catch { /* meta 写不进去不影响使用 */ }
+        rememberStore(dir, workspaceRoot);
+      }
+    }
+    return memory;
   }
 
   /**
@@ -259,15 +319,17 @@ export const apply = (ctx, rawConfig = {}) => {
    * 因为那正是当初"面板显示 0 条"的根因。
    */
   function storeByDir(dir) {
-    const key = `dir:${String(dir).toLowerCase()}`;
-    if (stores.has(key)) return stores.get(key);
-    try {
-      const memory = guardedOpenMemory({ dir, workspace: null, archiveDir: join(dir, 'archive') });
-      stores.set(key, memory);
-      return memory;
-    } catch (error) {
-      trace(ctx?.logger, 'store-open-by-dir-FAILED', { dir, message: String(error?.message ?? error).slice(0, 160) });
-      return null;
+    return cachedOpen(dir);
+  }
+
+  /** 记下"这个会话的这一条用户消息已经召回过"（顺带裁掉最老的，Map 不能无限长） */
+  function rememberRecallGuard(sessionId, key) {
+    recallGuard.delete(sessionId);
+    recallGuard.set(sessionId, key);
+    while (recallGuard.size > 300) {
+      const oldest = recallGuard.keys().next().value;
+      if (oldest === undefined) break;
+      recallGuard.delete(oldest);
     }
   }
 
@@ -368,6 +430,9 @@ export const apply = (ctx, rawConfig = {}) => {
   }
 
   const disposers = [];
+  /** 实际注册成功的工具/路由条数（apply-done 只报事实，不报期望） */
+  let registeredToolCount = 0;
+  let registeredRouteCount = 0;
 
   // ── 1. 工具 ─────────────────────────────────────────────────────────────
   disposers.push(
@@ -381,9 +446,13 @@ export const apply = (ctx, rawConfig = {}) => {
         memory: registry,
         config,
         // V1.7：显式 scope —— "user" 走用户级库（跨工作区），其余走当前工作区库
-        resolveMemory: (exec, opts) => (opts?.scope === 'user' ? globalStoreFor() ?? storeFor(workspaceOf(exec?.agent)) : storeFor(workspaceOf(exec?.agent))),
+        // V1.7：scope="user" 由 resolveUserMemory 单独处理（拿不到就报错）。
+        // 这里只负责"当前工作区"，**不再**把 user 请求静默降级到工作区库。
+        resolveMemory: (exec) => storeFor(workspaceOf(exec?.agent)),
         // V1.7：按 id 的工具（read/update/forget）自动认库 —— 主库里没有就回退用户级库
         fallbackMemory: () => globalStoreFor(),
+        // V1.7：scope="user" 的**写入**必须显式走用户级库；拿不到就报错，不回退工作区库
+        resolveUserMemory: () => globalStoreFor(),
         // V2-4：跨工作区检索用 —— 让工具能看到全部已知库
         listStores: () => listAllStores(),
         findStoreByLabelOrDir: (needle) => {
@@ -403,6 +472,7 @@ export const apply = (ctx, rawConfig = {}) => {
           },
         }),
       );
+      registeredToolCount = cleanup.length;
       trace(ctx?.logger, 'tools-registered', { count: cleanup.length });
       return () => cleanup.forEach((d) => { try { d?.(); } catch { /* 忽略 */ } });
     }),
@@ -447,7 +517,7 @@ export const apply = (ctx, rawConfig = {}) => {
             const agent = assembly?.agent;
             const memory = storeFor(workspaceOf(agent));
             if (!memory) return '（记忆库暂不可用）';
-            const entries = memory.list({ status: 'active', limit: 400 });
+            const entries = memory.listForIndex(400);
             return renderIndexSection({ entries });
           } catch (error) {
             trace(ctx?.logger, 'index-render-FAILED', { message: String(error?.message ?? error).slice(0, 200) });
@@ -529,6 +599,12 @@ export const apply = (ctx, rawConfig = {}) => {
           }
           if (untilSeq > since) {
             seenSeq.set(sessionId, untilSeq);
+            // 长跑进程里会话会越积越多：只留最近 300 个（最老的先走）。
+            while (seenSeq.size > 300) {
+              const oldest = seenSeq.keys().next().value;
+              if (oldest === undefined) break;
+              seenSeq.delete(oldest);
+            }
             try {
               memory.setMeta?.(`watermark:${sessionId}`, String(untilSeq));
             } catch {
@@ -567,8 +643,15 @@ export const apply = (ctx, rawConfig = {}) => {
 
           // ③ 自抑制：候选里先剔除自己注入过的，再取最后一条真实用户消息当 query
           const incoming = stripOwnInjections(decision.messages);
-          const query = lastUserText(incoming);
-          if (!query || query.length < 4) return decision;
+          const lastUser = lastUserMessage(incoming);
+          const query = lastUser ? textOf(lastUser).trim() : '';
+          // 2 字查询也是有效的（"滑雪"/"部署"/"发版"）—— 检索层 V4-1 就是按这个前提设计的；
+          // 1 字太泛，仍然拦掉。
+          if (!query || query.length < 2) return decision;
+          // 一个回合里 pre-step 会跑很多次（每次模型调用）；用户消息不变 → 只召回一次。
+          const guardKey = lastUser?.id ? String(lastUser.id) : query;
+          if (recallGuard.get(sessionId) === guardKey) return decision;
+          rememberRecallGuard(sessionId, guardKey);
 
           // V1.7：候选 = 当前工作区库 + 用户级库（合并去重、共享名额）。
           // 顺序有意为之：工作区放第 0 个 —— 同分时它优先（"项目里的事"比"用户级的事"更具体）。
@@ -581,6 +664,12 @@ export const apply = (ctx, rawConfig = {}) => {
             seen: injectState.seen(sessionId),
             maxItems: config.injectMaxItems,
           });
+          // 先渲染再记账：renderRecallBlock 会按字符预算 break —— **只有真的渲染进
+          // 提示词的条目才算注入**。被预算挤掉的条目如果也 mark/计数，会造成
+          // "用过 N 次"虚高，而且它们本轮之后再也不会被注入（2026-11-07 修）。
+          const text = picked.length ? renderRecallBlock(picked, { maxChars: config.injectMaxChars }) : '';
+          const delivered = text ? picked.filter((p) => text.includes(p.id)) : [];
+
           // V3 召回观测：**每一轮都记**，包括"搜到了但都被注入过"和"0 命中"这两种。
           // 0 命中是最需要的样本 —— 它正是"换个说法就搜不到"的直接证据。
           try {
@@ -590,39 +679,36 @@ export const apply = (ctx, rawConfig = {}) => {
               query: redactSecrets(query),
               segments: querySegments(query).length,
               hits: candidates.length,
-              picked: picked.length,
+              picked: delivered.length,
               // V4：把**注入的条目 ID（按顺序）**也记下来。
               // 以前只有计数（hits/picked），于是事后无法对账"当时召回了哪几条"，
               // 反馈闭环也就无从下手（任务书阶段三要求反馈能关联到具体记忆与排序）。
-              entryIds: picked.map((p) => p.id),
+              entryIds: delivered.map((p) => p.id),
               algoVersion: RECALL_ALGO_VERSION,
               keep: RECALL_RUN_KEEP,
             });
           } catch (error) {
             trace(ctx?.logger, 'record-recall-FAILED', { message: String(error?.message ?? error).slice(0, 160) });
           }
-          if (!picked.length) return decision;
-
-          const text = renderRecallBlock(picked, { maxChars: config.injectMaxChars });
-          if (!text) return decision;
+          if (!delivered.length) return decision;
 
           const message = createInjectedMessage(text, { form: 'recall' });
           // ② 只追加：插在"本轮已领取消息"之后（照官方 dsh-agent-instructions 的位置）
           const claimed = payload?.messages ?? [];
           const lastClaimed = decision.messages.findLastIndex((m) => claimed.includes(m));
           const entered = decision.messages.toSpliced(lastClaimed + 1, 0, message);
-          injectState.mark(sessionId, picked.map((p) => p.id));
+          injectState.mark(sessionId, delivered.map((p) => p.id));
           // V2-1 注入可见性：逐轮记账（面板据此显示"这条被用过几次 / 最近一次"）
           // ⚠ V1.7 起要**按条目所属的库**分开记：
           //   · injections 日志行记在工作区库（会话在哪就记在哪，面板读的是它）
           //   · 用户级条目的 inject_count 必须落在用户级库 —— 否则面板上它永远是"未用过"
-          const userIds = picked.filter((p) => p._scope === 'user').map((p) => p.id);
+          const userIds = delivered.filter((p) => p._scope === 'user').map((p) => p.id);
           try {
             memory.recordInjection({
               sessionId,
               workspace: workspaceOf(agent),
               form: 'recall',
-              entryIds: picked.filter((p) => p._scope !== 'user').map((p) => p.id),
+              entryIds: delivered.filter((p) => p._scope !== 'user').map((p) => p.id),
               chars: text.length,
             });
           } catch (error) {
@@ -637,7 +723,7 @@ export const apply = (ctx, rawConfig = {}) => {
           }
           trace(ctx?.logger, 'recall-injected', {
             sessionId,
-            ids: picked.map((p) => p.id),
+            ids: delivered.map((p) => p.id),
             fromUser: userIds.length,
             chars: text.length,
           });
@@ -660,6 +746,7 @@ export const apply = (ctx, rawConfig = {}) => {
           if (!type.startsWith('compaction/')) return;
           const sessionId = session?.id ?? 'unknown';
           injectState.reset(sessionId); // 压缩后"注入过"的记录不再成立
+          recallGuard.delete(sessionId); // 允许压缩后的第一次 pre-step 重新召回
           if (type === 'compaction/summary' || type === 'compaction/end') pending.add(sessionId);
         } catch {
           /* 忽略 */
@@ -686,24 +773,28 @@ export const apply = (ctx, rawConfig = {}) => {
             ...residentOf(memory, 'workspace'),
             ...(userMem && userMem !== memory ? residentOf(userMem, 'user') : []),
           ].filter((e, i, arr) => !e.sensitive && arr.findIndex((x) => memoryFingerprint(x) === memoryFingerprint(e)) === i);
-          const text = renderRecoveryBlock(resident.slice(0, config.injectMaxItems + 2), { maxChars: config.injectMaxChars });
+          const shown = resident.slice(0, config.injectMaxItems + 2);
+          const text = renderRecoveryBlock(shown, { maxChars: config.injectMaxChars });
           if (!text) return decision;
+          // 只对**真的渲染进提示词**的条目记账（与 recall 同一判据：按字符预算被挤掉的
+          // 条目如果也 mark，会"用过 N 次"虚高，且本轮之后再也不注入）。
+          const delivered = shown.filter((r) => text.includes(r.id));
           const message = createInjectedMessage(text, { form: 'recovery' });
           const claimed = payload?.messages ?? [];
           const lastClaimed = decision.messages.findLastIndex((m) => claimed.includes(m));
-          injectState.mark(sessionId, resident.map((r) => r.id));
+          injectState.mark(sessionId, delivered.map((r) => r.id));
           try {
             memory.recordInjection({
               sessionId,
               workspace: workspaceOf(payload?.agent),
               form: 'recovery',
-              entryIds: resident.filter((r) => r._scope !== 'user').map((r) => r.id),
+              entryIds: delivered.filter((r) => r._scope !== 'user').map((r) => r.id),
               chars: text.length,
             });
           } catch (error) {
             trace(ctx?.logger, 'record-recovery-FAILED', { message: String(error?.message ?? error).slice(0, 160) });
           }
-          const userResidentIds = resident.filter((r) => r._scope === 'user').map((r) => r.id);
+          const userResidentIds = delivered.filter((r) => r._scope === 'user').map((r) => r.id);
           if (userResidentIds.length && userMem) {
             try {
               userMem.bumpInjected(userResidentIds);
@@ -711,7 +802,7 @@ export const apply = (ctx, rawConfig = {}) => {
               /* 计数失败不影响注入 */
             }
           }
-          trace(ctx?.logger, 'recovery-injected', { sessionId, count: resident.length, fromUser: userResidentIds.length });
+          trace(ctx?.logger, 'recovery-injected', { sessionId, count: delivered.length, fromUser: userResidentIds.length });
           return { ...decision, messages: decision.messages.toSpliced(lastClaimed + 1, 0, message) };
         } catch (error) {
           trace(ctx?.logger, 'recovery-FAILED', { message: String(error?.message ?? error).slice(0, 200) });
@@ -1095,6 +1186,7 @@ export const apply = (ctx, rawConfig = {}) => {
             }),
           }),
         ];
+        registeredRouteCount = routes.length;
         trace(ctx?.logger, 'web-routes-registered', { prefix: API_PREFIX, count: routes.length });
         return () => routes.forEach((r) => { try { r?.(); } catch { /* 忽略 */ } });
       });
@@ -1118,17 +1210,11 @@ export const apply = (ctx, rawConfig = {}) => {
         /* 卸载期静默 */
       }
     }
-    for (const memory of stores.values()) {
-      try {
-        memory.close();
-      } catch {
-        /* 忽略 */
-      }
-    }
     // ⚠ 必须先把每个库**关掉**再清 Map（2026-10-12 修）。
     //   原来只有 `stores.clear()` —— Map 清空了，SQLite 连接还开着：
     //   Windows 上句柄不释放，临时目录删不掉（校验器尾部 rmSync 报 EPERM），
     //   插件热重载时也会一次次泄漏连接。判据：**close() 不是可选的**。
+    //   2026-11-07：这里原来**关了两遍**（上面还有一段同内容的循环），已合并成这一处。
     let closed = 0;
     for (const memory of stores.values()) {
       try {
@@ -1139,6 +1225,7 @@ export const apply = (ctx, rawConfig = {}) => {
       }
     }
     stores.clear();
+    failedStores.clear();
     trace(ctx?.logger, 'disposed', { storesClosed: closed });
   });
 
@@ -1190,13 +1277,10 @@ export const apply = (ctx, rawConfig = {}) => {
         }
       };
 
-      // 迁移前备份：**必须先于任何 openMemory() 迁移**，所以它单独走 backup.js 的
-      // backupBeforeMigration（裸打开、只读、不执行 DDL）。
-      const workspaceDb = join(memoryDirFor(process.cwd(), config.dirName) ?? DSH_HOME, 'memory.db');
-      void Promise.resolve({ ok: true, skipped: "已提前到 apply 顶部并带闸门" })
-        .then((r) => trace(ctx?.logger, 'pre-migration-backup', { ok: r.ok === true, reason: r.reason ?? null }))
-        .catch(() => { /* 备份失败不影响启动 */ });
-
+      // ⚠ 2026-11-07 删掉了原来那段假的"迁移前备份"：
+      //   `const workspaceDb = …; void Promise.resolve({ok:true,…}).then(log)`
+      //   —— 变量没人用，Promise 只写了一条"已提前到 apply 顶部"的日志，
+      //   看起来像做了备份、实际什么都没做。真正的迁移前备份在 ensureGateFor() 里。
       const timer = setInterval(() => { void runAll(); }, intervalMs);
       if (typeof timer.unref === 'function') timer.unref();   // 不因为它把进程吊住
 
@@ -1210,10 +1294,11 @@ export const apply = (ctx, rawConfig = {}) => {
   // ⚠ 报**实际**注册了什么，不是我希望注册了什么 —— 第一版这里写死了
   //   `sections: ['memory-lite:index','memory-lite:persona']`，于是两个段落都注册失败时
   //   日志照样说"注册了"，我差点据此误判。日志必须报事实。
+  //   2026-11-07：tools / routes 原来也是写死的 6，一并改成实测计数。
   fileLog('apply-done', {
-    tools: 6,
+    tools: registeredToolCount,
     sections: registeredSections,
-    routes: 6,
+    routes: registeredRouteCount,
     dirName: config.dirName,
   });
 };

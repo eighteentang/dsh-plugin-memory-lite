@@ -15,16 +15,20 @@ DSH 的会话本身是有记忆边界的：换一个会话、或者一次压缩�
 
 | 层 | 做什么 | 什么时候 | 成本 |
 |---|---|---|---|
-| **日志层** | 每轮结束把对话原样追加到本地 | 自动，每轮 | **零模型调用** |
+| **日志层** | 每轮结束把**本轮对话**（你的话 + 模型回复 + 工具结果摘要）追加到本地 | 自动，每轮 | **零模型调用** |
 | **长期条目层** | 把日志里的结论蒸馏成"记忆条目" | **你点「立即整理」时**（也可开启空闲自动） | 每次一次模型调用 |
 | **注入层** | 把你这句话相关的记忆作为**独立消息**追加到对话尾部 | 自动，每轮 | 零成本 |
 
 **日志层永远不进提示词** —— 只有蒸馏后的条目才会被注入。
 否则上下文预算和前缀缓存都会被日志淹没。
 
-**日志层存的不是"逐字原样"**：落盘前会剔掉宿主注入的系统样板（`<system-reminder>` 里的
-用户全局 `AGENTS.md` 等），也会去掉与前文重复的部分（实测 10 轮对话曾因此写出 804 KB，
-相邻两条有 6/9 对是"后一条完整包含前一条"）。没有内容的轮次干脆不记。
+**日志层存的不是"逐字原样"**：落盘前会
+- 丢掉宿主注入的运行时上下文（`source.kind` 为 `runtime-context` / `time-context` /
+  `skill-catalog` 的 user 消息**整条丢弃** —— 它们每轮都一样，实测占一条日志的约 40%）；
+- 只取模型回复的 `text` 块（思维链 `reasoning` 不进日志）；
+- 工具结果单条截断到 800 字（结论在模型回复里，工具输出只当证据）；
+- 去掉与前文重复的部分（实测 10 轮对话曾因此写出 804 KB，相邻两条有 6/9 对是
+  "后一条完整包含前一条"）。没有内容的轮次干脆不记。
 
 ---
 
@@ -33,7 +37,7 @@ DSH 的会话本身是有记忆边界的：换一个会话、或者一次压缩�
 命令行：
 
 ```
-dsh plugin --profile <你的profile名> add github:eighteentang/dsh-plugin-memory-lite#v1.3.0
+dsh plugin --profile <你的profile名> add github:eighteentang/dsh-plugin-memory-lite#v1.9.0
 ```
 
 或者**在界面里装**（不用命令行）：侧边栏 **「插件」→「添加插件」**，把地址贴进去。
@@ -41,20 +45,20 @@ dsh plugin --profile <你的profile名> add github:eighteentang/dsh-plugin-memor
 
 | 贴什么 | 结果 |
 |---|---|
-| `https://github.com/eighteentang/dsh-plugin-memory-lite#v1.3.0` | ✅ 装指定版本（**推荐**） |
+| `https://github.com/eighteentang/dsh-plugin-memory-lite#v1.9.0` | ✅ 装指定版本（**推荐**） |
 | `https://github.com/eighteentang/dsh-plugin-memory-lite` | ✅ 跟随主分支 |
-| `github:eighteentang/dsh-plugin-memory-lite#v1.3.0` | ✅ 同上两种写法都行 |
+| `github:eighteentang/dsh-plugin-memory-lite#v1.9.0` | ✅ 同上两种写法都行 |
 
-> ⚠ **别贴 Releases 页的地址。** `…/releases/tag/v1.3.0` 会被**直接拒绝**
+> ⚠ **别贴 Releases 页的地址。** `…/releases/tag/v1.9.0` 会被**直接拒绝**
 > （提示 `a URL must point at a git repository or a tarball`）—— 它只认**仓库根地址**
-> 或压缩包链接；版本要写成 `#v1.3.0` 拼在根地址后面。同理 `…/tree/main` 这类网页地址也不行。
+> 或压缩包链接；版本要写成 `#v1.9.0` 拼在根地址后面。同理 `…/tree/main` 这类网页地址也不行。
 >
 > 这几条不是猜的：宿主侧的解析函数 `parseInstallSpec` 曾被抽出来逐例跑过
 > （那是开发者本机的诊断脚本，**不随仓库发布** —— 见下方「关于本仓库不含开发工具」）。
 
 装完后**重启客户端**，设置页会出现 **「记忆控制」**。
 
-> **`#v1.3.0` 是版本钉子** —— 钉住版本避免"装到一半上游改了"。
+> **`#v1.9.0` 是版本钉子** —— 钉住版本避免"装到一半上游改了"。
 > 去掉 `#…` 就是跟随主分支（自动拿到新改动，也自动拿到新 bug）。
 > 全部版本见 [CHANGELOG.md](CHANGELOG.md)；升级就是**先卸载再装新版**
 > （DSH 的插件目前不支持自动更新）。
@@ -90,6 +94,7 @@ dsh plugin --profile <你的profile名> add github:eighteentang/dsh-plugin-memor
   它们被注入成 **system prompt 的一段**（位置紧跟框架自己的人设段）—— 所以是
   **每一轮都生效**，不像记忆库那样靠召回（规范类的东西"这轮没命中"就等于静默失效）。
   保存后下一轮立刻生效，不用重启；写前自动备份到同目录的 `backup/`。
+  **单个文本框上限 32 KB**（它们每一轮都进提示词，太长会长期挤占上下文）。
   > 代价：它们**随插件走** —— 插件停用/卸载，人设与准则就不生效了。
 - **下面是长期记忆列表**：搜索、按状态筛选、改状态（在用 / 已完成 / 已停用）、点「立即整理」。
   列表是**一行一条、行行等高**（`层级 · 项目 · 标题 · 敏感 · 用过N次 · 状态`），
@@ -134,7 +139,7 @@ $DSH_HOME/memory-lite/global/memory.db   ← 用户级（跨工作区）
 | 状态 | 含义 | 之后会怎样 |
 |---|---|---|
 | **在用** | 内容有效，可能被召回 | 正常参与注入与检索 |
-| **已完成** | 这件事做完了（todo 完成、话题达成目标） | **内容仍然有效**，仍可被搜到与召回 |
+| **已完成** | 这件事做完了（todo 完成、话题达成目标） | **内容仍然有效**，可用 `memory_search` 搜到；**不再参与自动召回**（避免把"已完成的事"反复塞回提示词） |
 | **已停用** | 这条不再正确或不再需要（过时、被取代、写错了） | 不再被注入，但仍可搜到、**可随时恢复** |
 
 ---
@@ -176,6 +181,12 @@ $DSH_HOME/memory-lite/workspaces.json ← 库 → 工作区 的注册表
     crossWorkspaceSearch: true    # 允许跨工作区检索
     distillProvider: ''           # 留空 = 用会话默认模型
     distillModel: ''
+    # ── 备份（默认开；autoBackup=false 会同时关掉"迁移前备份闸门"）──────────
+    autoBackup: true
+    backupIntervalHours: 24       # 日常备份间隔
+    backupKeep: 7                 # 日常备份保留份数
+    backupMigrationKeep: 3        # 迁移前备份保留份数（只在真要迁移时才生成）
+    backupDir: ''                 # 留空 = $DSH_HOME/memory-lite/backups
 ```
 
 **关于花额度**：默认 `autoDistill: false` —— 日志照记，但**只有你点「立即整理」时**才会调用模型。

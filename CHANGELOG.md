@@ -8,7 +8,7 @@
 **怎么钉版本**（避免"装到一半上游改了"）：
 
 ```sh
-dsh plugin --profile <你的profile名> add github:eighteentang/dsh-plugin-memory-lite#v1.8.0
+dsh plugin --profile <你的profile名> add github:eighteentang/dsh-plugin-memory-lite#v1.9.0
 ```
 
 > ⚠ **1.5.0 / 1.6.0 / 1.7.0 没有标签，而且是故意不补的**（2026-10-13 核实）：
@@ -21,6 +21,77 @@ dsh plugin --profile <你的profile名> add github:eighteentang/dsh-plugin-memor
 >
 > 这是仓库的 pre-push 钩子（`check-plugin-clean.mjs`）拦下来的 —— 它对新推的每棵树都查
 > BOM / 凭据 / 本机路径 / 不该进包的文件。**它是这道闸门，不是障碍。**
+
+---
+
+## [1.9.0] - 2026-11-07
+
+### 修复：日志层只记了"用户提问"，模型回复与工具结果全丢了（核心缺陷）
+
+**证据**：一个 11 轮的会话里有 **74 条 `assistant/message`**，而落库的日志里 **0 条**模型回复。
+根因是真实事件形状与代码假设不一致：
+
+| 事件 | 真实正文位置 | 旧实现读的 |
+|---|---|---|
+| `user/message` | `data.content[]` | ✅ 对 |
+| `assistant/message` | `data.message.content[]` | ❌ 读不到 |
+| `tool/result` | `data.message.content[]` | ❌ 读不到 |
+
+后果：蒸馏只能看到用户提问，永远长不出「结论 / 决策 / 教训」类记忆 —— 而这正是长期记忆的价值。
+现在 `textFromEvent()` 先取 `data.message ?? data`，再读 `content[]`，并且**只取 `text` 块**
+（思维链 `reasoning` 不进日志）；工具结果单条截断到 800 字。
+
+### 修复：运行时上下文被当成"用户消息"落库
+
+DSH 把 `runtime-context` / `time-context` / `skill-catalog` 也写成 `role:user`
+（实测 `data.source.kind`）。它们每轮逐字相同，实测占一条日志的约 40%。
+现在**按 kind 整条丢弃**（`lib/config.js` 的 `isHumanKind`），不再依赖会随版本漂移的正则；
+`cleanLogText()` 同时补上了当前版本的样板措辞，给存量日志兜底。
+
+### 修复：蒸馏先试了"没有模型"的提供方
+
+`/llm-probe` 实测本机 `deepseek-official` 已注册但 `listModels()` 为空，
+`deepseek-account` 才有 `deepseek-flash`。旧实现按注册顺序把无模型的排在最前；
+它一旦返回非 `CURABLE_CODES` 的错误就 `break`，真正可用的提供方永远轮不到。
+现在**有模型的先试、无模型的只作最后兜底**。另外补上了 `maxTokens` 调用参数
+（`DISTILL_MAX_TOKENS` 从 V1 起就是死常量；框架自己的压缩插件就是这么传的）。
+
+### 修复：迁移前备份"每次启动、每个库、同步全量"，而且永不清理
+
+- 只在**真的要迁移**（`schema_version` 落后或缺列）时才备份 —— 用新增的
+  `schemaNeedsMigration()` 判断。本机 7 个库结构都已最新，旧行为等于每次启动白做 7 份全量拷贝。
+- 迁移前备份单独计数（新增配置 `backupMigrationKeep`，默认 3），不再无限增长。
+
+### 修复：其它
+
+- **召回一个回合只跑一次**：`agent/pre-step` 是每次模型调用触发（实测 11 轮 = 74 个 step），
+  旧实现把同一句 query 反复全表扫描、把 `recall_runs` / `hit_count` 灌满重复样本。
+- **索引段不再每步读全库正文**：新增 `listForIndex()`（SQL 带 LIMIT、只取渲染需要的列、
+  正文截 160 字），替代每步 `SELECT *` 读全部条目。
+- **`scope="user"` 写入 fail-closed**：用户级库不可用时**报错**，不再静默写进当前工作区库。
+- **只对真的渲染进提示词的条目记账**：被字符预算挤掉的条目不再被 mark / 计数
+  （否则"用过 N 次"虚高，且这些条目本轮之后不再注入）。
+- **删除语义修正**：`subcategory` / `goal` 可以清空（原来 COALESCE 导致清不掉）；
+  条目写入与 FTS 写入放进同一事务；`importance` 写库时夹到 1~4；日志溢出时
+  **没有归档目录就一行都不删**（原来只覆盖了"归档写失败"）。
+- **代码卫生**：`apply-done` 的 `tools` / `routes` 改为实测计数（原来写死 6）；
+  卸载时不再把每个库 `close()` 两遍；删掉假的迁移前备份 Promise 与死变量；
+  `workspaces.json` 首次运行不存在不再记成 FAILED；打开失败的库 60 秒后重试
+  （原来一次失败缓存到进程重启）；`seenSeq` / 召回守卫有上限，不再无限增长。
+- **人设 / 规范单槽上限 32 KB**（它们每轮都进提示词）。
+- **2~3 字查询恢复召回**（检索层 V4-1 本来就是按"2 字也有意义"设计的，入口却卡在 4 字）。
+- **文档对齐**：README 的「已完成」状态改为"可搜到、不再自动召回"（与代码一致）；
+  日志层说明改为"用户 + 模型回复 + 工具结果摘要"。
+
+### 校验
+
+- 既有校验器 **319 项全绿**（v1 154 / v2 52 / 存储 34 / 客户端 36 / 面板 26 / 元数据 17）。
+- 新增专项回归 **38 项**（`tools/verify/verify-fix-1107.mjs`，不进仓库）：
+  捕获形状、样板清洗、`listForIndex`、事务、迁移判定、user 级 fail-closed、
+  模型目标顺序、备份轮转、persona 上限、apply 接线的"一回合一次召回"。
+- 真实会话重放：`D:\Workspace` 会话从"用户提问 4,718 字 / 无模型回复"变为
+  "68,979 字、含模型正文、无运行时样板、无思维链"。
+- ⚠ 仍未在真机验证：蒸馏的模型调用（本机 0 条待整理日志）、面板视觉、真实库恢复。
 
 ---
 
@@ -435,4 +506,5 @@ dsh plugin --profile <你的profile名> add github:eighteentang/dsh-plugin-memor
 [1.5.0]: https://github.com/eighteentang/dsh-plugin-memory-lite/releases/tag/v1.5.0
 [1.6.0]: https://github.com/eighteentang/dsh-plugin-memory-lite/releases/tag/v1.6.0
 [1.7.0]: https://github.com/eighteentang/dsh-plugin-memory-lite/releases/tag/v1.7.0
+[1.9.0]: https://github.com/eighteentang/dsh-plugin-memory-lite/releases/tag/v1.9.0
 [1.8.0]: https://github.com/eighteentang/dsh-plugin-memory-lite/releases/tag/v1.8.0
