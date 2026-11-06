@@ -430,9 +430,8 @@ export const apply = (ctx, rawConfig = {}) => {
   }
 
   const disposers = [];
-  /** 实际注册成功的工具/路由条数（apply-done 只报事实，不报期望） */
+  /** 实际注册成功的工具条数（apply-done 只报事实，不报期望） */
   let registeredToolCount = 0;
-  let registeredRouteCount = 0;
 
   // ── 1. 工具 ─────────────────────────────────────────────────────────────
   disposers.push(
@@ -1186,7 +1185,11 @@ export const apply = (ctx, rawConfig = {}) => {
             }),
           }),
         ];
-        registeredRouteCount = routes.length;
+        // ⚠ 路由是在 `ctx.inject(['webServer'], …)` 的回调里注册的，而这个回调
+        //   **晚于 apply 返回**才执行 —— 所以条数不能写进 apply-done（那一刻恒为 0，
+        //   写进去就是假事实；2026-11-07 真机验证：apply-done 报 routes:0，而
+        //   /api/snapshot 实际可用）。什么时候注册完、注册了几条，单独落这一行。
+        fileLog('web-routes-done', { count: routes.length });
         trace(ctx?.logger, 'web-routes-registered', { prefix: API_PREFIX, count: routes.length });
         return () => routes.forEach((r) => { try { r?.(); } catch { /* 忽略 */ } });
       });
@@ -1294,11 +1297,11 @@ export const apply = (ctx, rawConfig = {}) => {
   // ⚠ 报**实际**注册了什么，不是我希望注册了什么 —— 第一版这里写死了
   //   `sections: ['memory-lite:index','memory-lite:persona']`，于是两个段落都注册失败时
   //   日志照样说"注册了"，我差点据此误判。日志必须报事实。
-  //   2026-11-07：tools / routes 原来也是写死的 6，一并改成实测计数。
+  //   2026-11-07：tools 也改成实测计数；routes 从这条里**移除**（它是延迟注册的，
+  //   写在这里必然是 0 —— 见 web-routes-done）。
   fileLog('apply-done', {
     tools: registeredToolCount,
     sections: registeredSections,
-    routes: registeredRouteCount,
     dirName: config.dirName,
   });
 };

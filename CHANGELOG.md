@@ -24,6 +24,22 @@ dsh plugin --profile <你的profile名> add github:eighteentang/dsh-plugin-memor
 
 ---
 
+## [1.9.1] - 2026-11-07
+
+### 修复：`apply-done` 日志误报 `routes: 0`
+
+1.9.0 把写死的 `routes: 6` 改成实测计数后，真机暴露了一个**时序事实**：HTTP 路由是在
+`ctx.inject(['webServer'], …)` 的回调里注册的，而这个回调**晚于 apply 返回**才执行
+（实测：`apply-done` 写 `routes: 0`，而 `/api/snapshot` 实际可用）。
+
+- `apply-done` 不再包含 `routes`（那一刻它必然是 0，写进去就是假事实）。
+- 新增独立日志行 `web-routes-done {count: N}`：路由真正注册完时写入，条数准确。
+- 回归：专项脚本扩到 **45 项**（新增「apply-done 不带 routes」「web-routes-done count=6」两条），全量 8 个校验器仍全绿。
+
+> 教训：**"改成实测计数"本身也可能制造假事实** —— 计数必须在事实发生之后取。
+
+---
+
 ## [1.9.0] - 2026-11-07
 
 ### 修复：日志层只记了"用户提问"，模型回复与工具结果全丢了（核心缺陷）
@@ -86,7 +102,7 @@ DSH 把 `runtime-context` / `time-context` / `skill-catalog` 也写成 `role:use
 ### 校验
 
 - 既有校验器 **319 项全绿**（v1 154 / v2 52 / 存储 34 / 客户端 36 / 面板 26 / 元数据 17）。
-- 新增专项回归 **38 项**（`tools/verify/verify-fix-1107.mjs`，不进仓库）：
+- 新增专项回归 **43 项**（`tools/verify/verify-fix-1107.mjs`，不进仓库）：
   捕获形状、样板清洗、`listForIndex`、事务、迁移判定、user 级 fail-closed、
   模型目标顺序、备份轮转、persona 上限、apply 接线的"一回合一次召回"。
 - 真实会话重放：`D:\Workspace` 会话从"用户提问 4,718 字 / 无模型回复"变为
