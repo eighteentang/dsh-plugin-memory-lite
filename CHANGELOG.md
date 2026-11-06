@@ -24,6 +24,52 @@ dsh plugin --profile <你的profile名> add github:eighteentang/dsh-plugin-memor
 
 ---
 
+## [1.10.0] - 2026-11-07
+
+### 新增：让记忆真的长出来
+
+- **记忆使用说明常驻注入**（`injectGuide`，默认开，约 260 字）：什么时候该记/不该记、
+  多数轮次什么都不记、写前先查重、`scope="user"` 的分工。**空库也注入** —— 否则
+  "没指令 → 不写 → 库空 → 仍不注入"是自封闭死循环（参考 justhalfbit/dsh-plugin-memory）。
+- **蒸馏候选队列**（`distillReview`，默认开）：整理结果落 `pending_entries`，面板「采纳/丢弃」；
+  采纳走 upsert，不会制造重复；候选不参与检索、不参与注入。
+- **健康度可见**：面板 + `memory_stats` 显示「最近一次沉淀（含被跳过的原因）/ 最近一次整理 /
+  待采纳 / 召回概况 / 反馈数」。capture 的跳过原因（too-short / cooldown / duplicate /
+  daily-quota）落 meta，重启后仍在 —— 静默跳过是这个项目最大的坑。
+- **导出 Markdown**：面板「导出」一键下载（纯文本、可读、可 git）。
+- **反馈闭环**：新增 `memory_feedback` 工具（第 7 个）+ `/feedback` 路由；写
+  `recall_runs.feedback`，按算法版本统计。
+
+### 检索（RECALL_ALGO_VERSION v4.1 → v5.0）
+
+- 新增 **trigram FTS**（SQLite 内置，零依赖）：中文 ≥3 字子串可被 bm25 排序；
+  2 字查询仍走 LIKE。trigram 的 bm25 量级极小（≈ -1e-6），改用**批内序位**打分，
+  避免"有 3 字重叠就满分"。
+
+### 写入质量
+
+- **写入去重三层**：`content_hash`（新列，schema v2）→ 前 40 字相同 → 关键词 Jaccard；
+  `upsert()` 返回 created / updated / skipped。
+- **每层上限 + 淘汰**（`maxEntriesPerLevel`）：蒸馏产物优先淘汰、`user/rules/soul`
+  与用户纠正过的永不淘汰。
+- 蒸馏不再用「标题 vs 正文」的弱比较。
+
+### 正确性与成本
+
+- **召回判重改为"可见面"**：注入块把条目 id 写进 `source.ids`，每轮从消息列表反查；
+  重启 / resume / fork 后不再重复注入。
+- **子代理会话跳过**捕获与召回（探测 `AgentOptions.subagentDepth` / `parentSessionId`）。
+- schema 迁移后**回写 `schema_version`**（旧实现只读不写 → 每次启动都白备份一次）。
+
+### 校验
+
+- 既有 319 项 + 专项回归 **76 项**全绿（新增：说明段、三层去重、淘汰、候选采纳/丢弃、
+  trigram 索引一致、反馈、导出、注入 ids 往返、子代理跳过）。
+- ⚠ 未真机验证：trigram 的实际召回增益（需真库 A/B）、子代理字段（按宿主类型定义实现，
+  未在真实子代理会话里跑过）、面板新 UI 的像素效果。
+
+---
+
 ## [1.9.1] - 2026-11-07
 
 ### 修复：`apply-done` 日志误报 `routes: 0`
@@ -522,5 +568,7 @@ DSH 把 `runtime-context` / `time-context` / `skill-catalog` 也写成 `role:use
 [1.5.0]: https://github.com/eighteentang/dsh-plugin-memory-lite/releases/tag/v1.5.0
 [1.6.0]: https://github.com/eighteentang/dsh-plugin-memory-lite/releases/tag/v1.6.0
 [1.7.0]: https://github.com/eighteentang/dsh-plugin-memory-lite/releases/tag/v1.7.0
+[1.10.0]: https://github.com/eighteentang/dsh-plugin-memory-lite/releases/tag/v1.10.0
+[1.9.1]: https://github.com/eighteentang/dsh-plugin-memory-lite/releases/tag/v1.9.1
 [1.9.0]: https://github.com/eighteentang/dsh-plugin-memory-lite/releases/tag/v1.9.0
 [1.8.0]: https://github.com/eighteentang/dsh-plugin-memory-lite/releases/tag/v1.8.0

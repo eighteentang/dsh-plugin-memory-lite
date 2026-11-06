@@ -514,9 +514,55 @@ textarea.ml-input { line-height: 1.65; resize: vertical; }
               notice: `整理跑通了，但模型没产出条目（它返回了 ${out?.result?.rawLength ?? 0} 字）。原始输出已记在库里，告诉我一声我来查。`,
             }));
           } else {
-            setState((s) => ({ ...s, error: null, notice: `整理完成：新增 ${out.result.created ?? 0} 条，更新 ${out.result.updated ?? 0} 条。` }));
+            setState((s) => ({
+              ...s,
+              error: null,
+              notice: `整理完成：新增 ${out.result.created ?? 0} 条，更新 ${out.result.updated ?? 0} 条，候选 ${out.result.pending ?? 0} 条（待采纳），跳过 ${out.result.skipped ?? 0} 条。`,
+            }));
           }
           await reload();
+        } catch (error) {
+          setState((s) => ({ ...s, error: String(error?.message ?? error) }));
+        } finally {
+          setBusy('');
+        }
+      };
+
+      // ── v2：候选采纳/丢弃 + 导出 Markdown ─────────────────────────────────
+      const doPending = async (id, action) => {
+        setBusy(id + action);
+        setState((s) => ({ ...s, error: null, notice: null }));
+        try {
+          const out = await api(action === 'approve' ? '/pending-approve' : '/pending-discard', { id, dir: currentDir });
+          if (out?.ok === false) throw new Error(out.error ?? '操作失败');
+          setState((s) => ({
+            ...s,
+            notice: action === 'approve'
+              ? `已采纳（${out.action === 'updated' ? '合并进已有条目' : out.action === 'skipped' ? '库里已有，未重复写入' : '新增'}）。`
+              : '已丢弃这条候选。',
+          }));
+          await reload();
+        } catch (error) {
+          setState((s) => ({ ...s, error: String(error?.message ?? error) }));
+        } finally {
+          setBusy('');
+        }
+      };
+
+      const doExport = async () => {
+        setBusy('export');
+        setState((s) => ({ ...s, error: null, notice: null }));
+        try {
+          const out = await api('/export', { dir: currentDir });
+          if (!out?.ok) throw new Error(out?.error ?? '导出失败');
+          const blob = new Blob([String(out.markdown ?? '')], { type: 'text/markdown;charset=utf-8' });
+          const url = URL.createObjectURL(blob);
+          const a = document.createElement('a');
+          a.href = url;
+          a.download = String(out.filename ?? 'memory-lite.md');
+          a.click();
+          setTimeout(() => URL.revokeObjectURL(url), 1500);
+          setState((s) => ({ ...s, notice: `已导出 ${out.filename}` }));
         } catch (error) {
           setState((s) => ({ ...s, error: String(error?.message ?? error) }));
         } finally {
@@ -580,6 +626,71 @@ textarea.ml-input { line-height: 1.65; resize: vertical; }
               ? '保存时会先备份；文本框里写什么，文件里就是什么'
               : '保存后下一轮立刻生效，不用重启'),
           ].filter(Boolean)),
+        ]);
+      }
+
+      /** v2 健康度：把"为什么没有记忆/日志"变成可读的事实 */
+      function renderHealth(store) {
+        const health = store?.health;
+        if (!health) return null;
+        const capture = health.capture ?? null;
+        const lastLog = capture?.lastLog ? `${fmtTime(capture.lastLog.at)}（${capture.lastLog.chars} 字）` : '从未';
+        const skips = capture?.skips && Object.keys(capture.skips).length
+          ? Object.entries(capture.skips).sort((a, b) => b[1] - a[1]).slice(0, 3).map(([k, v]) => `${k}×${v}`).join(' ')
+          : '';
+        const lastDistill = health.lastDistill
+          ? `${health.lastDistill.outcome ?? '?'} · ${fmtTime(health.lastDistill.at)}`
+          : '从未';
+        const recall = health.recall ? `召回 ${health.recall.runs} 轮 · 注入 ${health.recall.injected} 条` : '召回 —';
+        const feedback = health.feedback?.marked ? ` · 反馈 ${health.feedback.marked} 条` : '';
+        return h('div', {
+          key: 'health',
+          className: 'ml-card',
+          style: { ...css.look.card, padding: '8px 12px', fontSize: 12, display: 'flex', flexDirection: 'column', gap: 3 },
+        }, [
+          h('div', { key: 'a' }, `最近沉淀：${lastLog}${skips ? `　跳过：${skips}` : ''}`),
+          h('div', { key: 'b' }, `最近整理：${lastDistill}　待采纳：${health.pending ?? 0} 条`),
+          h('div', { key: 'c' }, `${recall}${feedback}`),
+        ]);
+      }
+
+      /** v2 候选列表：采纳才进正式库、才会被召回 */
+      function renderPending(store, items) {
+        void store;
+        return h('div', {
+          key: 'pending',
+          className: 'ml-card',
+          style: { ...css.look.card, padding: '8px 12px', display: 'flex', flexDirection: 'column', gap: 2 },
+        }, [
+          h('div', { key: 'h', className: 'ml-h' }, [
+            h('strong', { key: 't' }, `待采纳的记忆候选（${items.length}）`),
+            h('span', { key: 'f' }, '来自「立即整理」；采纳后才进正式库、才会被召回'),
+          ]),
+          ...items.map((p) => h('div', {
+            key: p.id,
+            style: { display: 'grid', gridTemplateColumns: '52px 1fr auto auto', gap: 8, alignItems: 'center', padding: '3px 0' },
+          }, [
+            h(Tag, { key: 'l', style: { width: 52, textAlign: 'center' } }, LEVEL_LABEL[p.level] ?? p.level),
+            h('span', {
+              key: 't',
+              title: p.content,
+              style: { minWidth: 0, overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' },
+            }, p.title || String(p.content ?? '').replace(/\s+/g, ' ').slice(0, 60)),
+            h('button', {
+              key: 'a',
+              className: 'ml-btn ml-btn-primary',
+              style: css.look.btnPrimary,
+              disabled: busy !== '',
+              onClick: () => doPending(p.id, 'approve'),
+            }, busy === p.id + 'approve' ? '采纳中…' : '采纳'),
+            h('button', {
+              key: 'd',
+              className: 'ml-btn',
+              style: css.look.btn,
+              disabled: busy !== '',
+              onClick: () => doPending(p.id, 'discard'),
+            }, '丢弃'),
+          ])),
         ]);
       }
 
@@ -648,6 +759,14 @@ textarea.ml-input { line-height: 1.65; resize: vertical; }
           ]),
           h('button', { key: 'r', className: 'ml-btn', style: css.look.btn, onClick: reload, disabled: state.loading || busy !== '' }, '刷新'),
           h('button', {
+            key: 'e',
+            className: 'ml-btn',
+            style: css.look.btn,
+            disabled: busy !== '',
+            title: '把当前库导出成 Markdown（可读 / 可 git 备份）',
+            onClick: doExport,
+          }, busy === 'export' ? '导出中…' : '导出'),
+          h('button', {
             key: 'd',
             className: 'ml-btn',
             style: css.look.btn,
@@ -663,6 +782,11 @@ textarea.ml-input { line-height: 1.65; resize: vertical; }
           : null,
         !(state.error ?? state.snapshotError) && state.notice
           ? h('div', { key: 'notice', className: 'ml-ok' }, state.notice)
+          : null,
+        // ══ v2：健康度 + 待采纳候选（"为什么没有记忆"必须看得见）══════════
+        state.loading ? null : renderHealth(currentStore),
+        !state.loading && (currentStore?.pending ?? []).length
+          ? renderPending(currentStore, currentStore.pending)
           : null,
         // ══ 块 3／3：列表 ═══════════════════════════════════════════════════
         state.loading

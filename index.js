@@ -18,8 +18,8 @@ import { appendFileSync, existsSync, mkdirSync, readdirSync, readFileSync, write
 
 import { Config as MemoryConfig, resolveConfig, redactSecrets, RECALL_RUN_KEEP, RECALL_ALGO_VERSION } from './lib/config.js';
 import { openMemory, memoryDirFor, querySegments, schemaNeedsMigration } from './lib/storage.js';
-import { renderIndexSection, renderRecallBlock, renderRecoveryBlock } from './lib/prompt.js';
-import { createInjectState, createInjectedMessage, isOwnInjection, lastUserMessage, textOf, stripOwnInjections, pickForInjection, mergeRecallCandidates, memoryFingerprint } from './lib/inject.js';
+import { renderIndexSection, renderRecallBlock, renderRecoveryBlock, renderGuideSection, renderMarkdownExport } from './lib/prompt.js';
+import { createInjectState, createInjectedMessage, isOwnInjection, lastUserMessage, textOf, injectedIdsFromMessages, stripOwnInjections, pickForInjection, mergeRecallCandidates, memoryFingerprint } from './lib/inject.js';
 import { captureTurn, extractTurnText } from './lib/capture.js';
 import { buildTools, DESTRUCTIVE_TOOLS, normalizeEntryInput } from './lib/tools.js';
 import { readPersona, writePersona, renderPersonaSection } from './lib/persona.js';
@@ -132,6 +132,31 @@ export const apply = (ctx, rawConfig = {}) => {
   const recallGuard = new Map();
   /** 最近一次被 agent 解析到的工作区 —— 面板没有 agent 上下文时的一个兜底 */
   let lastWorkspace = null;
+
+  /**
+   * 是不是子代理会话？
+   *
+   * 依据（从宿主包里核实）：`AgentOptions.subagentDepth?: number`，以及子代理 RPC 里的
+   * `parentSessionId` / `childSessionId`。子代理会话不该再跑一遍捕获/召回 ——
+   * 它读的是父会话的上下文，再注入一份等于双份 token，日志层也会被拆成两库。
+   * 字段探测失败时按"不是子代理"处理（宁可多跑，不要漏掉主会话）。
+   */
+  function isSubagentSession(agent) {
+    try {
+      if (Number(agent?.options?.subagentDepth) > 0) return true;
+      const header = agent?.session?.header;
+      if (header?.parentSessionId || Number(header?.subagentDepth) > 0) return true;
+      if (agent?.session?.summary?.parentSessionId) return true;
+    } catch {
+      /* 忽略 */
+    }
+    return false;
+  }
+
+  /** 子代理跳过开关（config.skipSubagents 默认 true） */
+  function shouldSkipSession(agent) {
+    return config.skipSubagents !== false && isSubagentSession(agent);
+  }
 
   /**
    * 记忆库注册表：把"哪个目录是记忆库、对应哪个工作区"记在文件里。
@@ -529,6 +554,28 @@ export const apply = (ctx, rawConfig = {}) => {
     }),
   );
 
+  // ── 3·二. 记忆使用说明（常驻；空库也注入）────────────────────────────────
+  // 为什么单列一段而不是塞进索引段：索引段是**数据**（条目列表，会随库变化），
+  // 这段是**行为指引**（常量）。分开后：①索引段仍字节稳定；②说明可以单独开关；
+  // ③索引段渲染失败时说明照样在。
+  disposers.push(
+    guarded(ctx?.logger, 'guide-section', () => {
+      if (!config.injectGuide) return () => {};
+      const prompt = ctx.systemPrompt;
+      if (typeof prompt?.section !== 'function') throw new Error('ctx.systemPrompt.section 不可用');
+      const raw = typeof prompt.getSectionOrder === 'function' ? prompt.getSectionOrder('TOOLS_SDK') : 4000;
+      const base = Number.isFinite(raw) ? raw : 4000;
+      const disposer = prompt.section({
+        name: 'memory-lite:guide',
+        order: base - 1, // 紧挨着记忆索引段（说明在索引之前）
+        interpolate: false,
+        text: () => renderGuideSection(),
+      });
+      registeredSections.push('memory-lite:guide');
+      return disposer;
+    }),
+  );
+
   // ── 3·五. 人设 / 工作规范段（V1.6：插件自己的文件，注入到框架的人设位置）──────
   // 为什么用 systemPrompt 段落而不是写进用户的 AGENTS.md：
   //   框架自己就有人设槽位（SECTION_ORDERS 里的 DEPLOYMENT_PERSONA_PREFIX = 0、后缀 = 10200），
@@ -571,6 +618,7 @@ export const apply = (ctx, rawConfig = {}) => {
           // V2-2：刷新"最后活动时间"——空闲自动整理靠它判断"是不是真的闲了"
           lastActivityAt = Date.now();
           const agent = payload?.agent;
+          if (shouldSkipSession(agent)) return; // 子代理不配写日志层
           if (!config.autoCapture) return;
           const session = agent?.session;
           const sessionId = session?.id ?? agent?.id;
@@ -618,6 +666,10 @@ export const apply = (ctx, rawConfig = {}) => {
             text,
             enabled: true,
           });
+          // 跳过原因落库（面板/统计据此解释"为什么日志层没长"）—— 静默跳过是本项目最大的坑。
+          if (!result.written && result.reason) {
+            try { memory.recordCaptureSkip(result.reason); } catch { /* 计数失败不影响主流程 */ }
+          }
           trace(ctx?.logger, 'capture', { sessionId, ...result, chars: result.chars ?? 0 });
         } catch (error) {
           trace(ctx?.logger, 'capture-FAILED', { message: String(error?.message ?? error).slice(0, 200) });
@@ -636,6 +688,7 @@ export const apply = (ctx, rawConfig = {}) => {
           if (decision?.kind !== 'enter' || !Array.isArray(decision.messages)) return decision;
 
           const agent = payload?.agent;
+          if (shouldSkipSession(agent)) return decision; // 子代理不注入（父会话已经注入过）
           const sessionId = agent?.session?.id ?? agent?.id ?? 'unknown';
           const memory = storeFor(workspaceOf(agent));
           if (!memory) return decision;
@@ -658,9 +711,14 @@ export const apply = (ctx, rawConfig = {}) => {
           const userMemory = globalStoreFor();
           if (userMemory && userMemory !== memory) sources.push({ memory: userMemory, tag: 'user' });
           const candidates = mergeRecallCandidates(sources, query, { limitPerStore: 12 });
+          // 已注入集合 = 进程内记录 + **当前消息列表里自己留下的注入块**。
+          // 后者是跨重启/resume 的唯一可靠依据（进程内 Set 一重启就归零 → 同一批记忆会再注入一遍）。
+          let surfaced = new Set();
+          try { surfaced = injectedIdsFromMessages(decision.messages); } catch { /* 忽略 */ }
+          const seen = new Set([...injectState.seen(sessionId), ...surfaced]);
           const picked = pickForInjection(candidates, {
             sessionId,
-            seen: injectState.seen(sessionId),
+            seen,
             maxItems: config.injectMaxItems,
           });
           // 先渲染再记账：renderRecallBlock 会按字符预算 break —— **只有真的渲染进
@@ -691,7 +749,7 @@ export const apply = (ctx, rawConfig = {}) => {
           }
           if (!delivered.length) return decision;
 
-          const message = createInjectedMessage(text, { form: 'recall' });
+          const message = createInjectedMessage(text, { form: 'recall', ids: delivered.map((p) => p.id) });
           // ② 只追加：插在"本轮已领取消息"之后（照官方 dsh-agent-instructions 的位置）
           const claimed = payload?.messages ?? [];
           const lastClaimed = decision.messages.findLastIndex((m) => claimed.includes(m));
@@ -757,6 +815,7 @@ export const apply = (ctx, rawConfig = {}) => {
           const sessionId = payload?.agent?.session?.id ?? payload?.agent?.id ?? 'unknown';
           if (!pending.has(sessionId) || decision?.kind !== 'enter' || !Array.isArray(decision.messages)) return decision;
           pending.delete(sessionId);
+          if (shouldSkipSession(payload?.agent)) return decision;
           const memory = storeFor(workspaceOf(payload?.agent));
           if (!memory) return decision;
           // 压缩后补回「常驻层」（user/rules + 重要性≥3 的条目）
@@ -778,7 +837,7 @@ export const apply = (ctx, rawConfig = {}) => {
           // 只对**真的渲染进提示词**的条目记账（与 recall 同一判据：按字符预算被挤掉的
           // 条目如果也 mark，会"用过 N 次"虚高，且本轮之后再也不注入）。
           const delivered = shown.filter((r) => text.includes(r.id));
-          const message = createInjectedMessage(text, { form: 'recovery' });
+          const message = createInjectedMessage(text, { form: 'recovery', ids: delivered.map((r) => r.id) });
           const claimed = payload?.messages ?? [];
           const lastClaimed = decision.messages.findLastIndex((m) => claimed.includes(m));
           injectState.mark(sessionId, delivered.map((r) => r.id));
@@ -922,6 +981,46 @@ export const apply = (ctx, rawConfig = {}) => {
         dbPath: memory.dbPath,
         workspace: memory.getMeta('workspace') ?? null,
         stats: memory.stats(),
+        // v2 健康度：用户/面板最需要的四个事实 —— 最近一次沉淀、待整理、最近一次整理、召回概况
+        health: (() => {
+          try {
+            const lastDistill = memory.lastDistillRun?.() ?? null;
+            const runs = memory.recentRecallRuns?.(50) ?? [];
+            return {
+              capture: memory.captureHealth?.() ?? null,
+              pending: memory.countPending?.() ?? 0,
+              lastDistill: lastDistill
+                ? {
+                  at: lastDistill.finished_at ?? lastDistill.started_at ?? null,
+                  outcome: lastDistill.outcome ?? null,
+                  created: lastDistill.created ?? 0,
+                  updated: lastDistill.updated ?? 0,
+                  note: String(lastDistill.note ?? '').slice(0, 300),
+                }
+                : null,
+              recall: {
+                runs: runs.length,
+                hits: runs.reduce((a, r) => a + (r.hits ?? 0), 0),
+                injected: runs.reduce((a, r) => a + (r.picked ?? 0), 0),
+                lastAt: runs[0]?.createdAt ?? null,
+              },
+              feedback: memory.recallFeedbackStats?.(200) ?? null,
+            };
+          } catch {
+            return null;
+          }
+        })(),
+        pending: (memory.listPending?.(50) ?? []).map((e) => ({
+          id: e.id,
+          level: e.level,
+          title: e.title,
+          content: String(e.content).slice(0, 800),
+          keywords: e.keywords,
+          importance: e.importance,
+          project: e.project,
+          sensitive: e.sensitive,
+          createdAt: e.createdAt,
+        })),
         entries: memory.list({ status: null, limit: 1000 }).map((e) => ({
           id: e.id,
           level: e.level,
@@ -1182,6 +1281,65 @@ export const apply = (ctx, rawConfig = {}) => {
               if (!memory) return { ok: false, error: '记忆库不可用' };
               const result = await runDistill({ memory, config, llm: ctx.get?.('llm') ?? ctx.llm, force: true });
               return { ok: Boolean(result.ok), result };
+            }),
+          }),
+          // ── v2：蒸馏候选的采纳 / 丢弃 ─────────────────────────────────────
+          server.register({
+            kind: 'exact',
+            path: `${API_PREFIX}/pending-approve`,
+            handler: makeHandler(async (req) => {
+              const body = await readBody(req);
+              const memory = resolveRouteStore(dirFromRequest(req, body));
+              if (!memory?.approvePending) return { ok: false, error: '记忆库不可用' };
+              const out = memory.approvePending(String(body.id ?? ''), config.maxEntriesPerLevel ?? 0);
+              if (!out.ok) return out;
+              return {
+                ok: true,
+                action: out.action,
+                entry: out.entry ? { id: out.entry.id, level: out.entry.level, title: out.entry.title, status: out.entry.status } : null,
+              };
+            }),
+          }),
+          server.register({
+            kind: 'exact',
+            path: `${API_PREFIX}/pending-discard`,
+            handler: makeHandler(async (req) => {
+              const body = await readBody(req);
+              const memory = resolveRouteStore(dirFromRequest(req, body));
+              if (!memory?.discardPending) return { ok: false, error: '记忆库不可用' };
+              return memory.discardPending(String(body.id ?? ''));
+            }),
+          }),
+          // ── v2：导出 Markdown（纯文本备份/可读/可 git）──────────────────────
+          server.register({
+            kind: 'exact',
+            path: `${API_PREFIX}/export`,
+            handler: makeHandler(async (req) => {
+              const body = await readBody(req);
+              const memory = resolveRouteStore(dirFromRequest(req, body));
+              if (!memory) return { ok: false, error: '记忆库不可用' };
+              const entries = memory.list({ status: null, limit: 100000 });
+              const workspace = memory.getMeta('workspace') ?? memory.dir;
+              const stamp = new Date().toISOString().slice(0, 10);
+              return {
+                ok: true,
+                filename: `memory-lite-${stamp}.md`,
+                markdown: renderMarkdownExport(entries, { title: `memory-lite 记忆导出 · ${workspace}` }),
+              };
+            }),
+          }),
+          // ── v2：召回反馈（写 recall_runs.feedback；面板/工具共用）────────────
+          server.register({
+            kind: 'exact',
+            path: `${API_PREFIX}/feedback`,
+            handler: makeHandler(async (req) => {
+              const body = await readBody(req);
+              const memory = resolveRouteStore(dirFromRequest(req, body));
+              if (!memory?.setRecallFeedback) return { ok: false, error: '记忆库不可用' };
+              const entryId = String(body.id ?? '');
+              const runId = Number(body.runId) || memory.findLatestRecallRunForEntry(entryId);
+              if (!runId) return { ok: false, error: '这条记忆还没有被召回记录，无法反馈' };
+              return memory.setRecallFeedback(runId, entryId, String(body.verdict ?? ''), body.note ? String(body.note).slice(0, 200) : null);
             }),
           }),
         ];

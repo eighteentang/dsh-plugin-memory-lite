@@ -37,7 +37,7 @@ DSH 的会话本身是有记忆边界的：换一个会话、或者一次压缩�
 命令行：
 
 ```
-dsh plugin --profile <你的profile名> add github:eighteentang/dsh-plugin-memory-lite#v1.9.1
+dsh plugin --profile <你的profile名> add github:eighteentang/dsh-plugin-memory-lite#v1.10.0
 ```
 
 或者**在界面里装**（不用命令行）：侧边栏 **「插件」→「添加插件」**，把地址贴进去。
@@ -45,20 +45,20 @@ dsh plugin --profile <你的profile名> add github:eighteentang/dsh-plugin-memor
 
 | 贴什么 | 结果 |
 |---|---|
-| `https://github.com/eighteentang/dsh-plugin-memory-lite#v1.9.1` | ✅ 装指定版本（**推荐**） |
+| `https://github.com/eighteentang/dsh-plugin-memory-lite#v1.10.0` | ✅ 装指定版本（**推荐**） |
 | `https://github.com/eighteentang/dsh-plugin-memory-lite` | ✅ 跟随主分支 |
-| `github:eighteentang/dsh-plugin-memory-lite#v1.9.1` | ✅ 同上两种写法都行 |
+| `github:eighteentang/dsh-plugin-memory-lite#v1.10.0` | ✅ 同上两种写法都行 |
 
-> ⚠ **别贴 Releases 页的地址。** `…/releases/tag/v1.9.1` 会被**直接拒绝**
+> ⚠ **别贴 Releases 页的地址。** `…/releases/tag/v1.10.0` 会被**直接拒绝**
 > （提示 `a URL must point at a git repository or a tarball`）—— 它只认**仓库根地址**
-> 或压缩包链接；版本要写成 `#v1.9.1` 拼在根地址后面。同理 `…/tree/main` 这类网页地址也不行。
+> 或压缩包链接；版本要写成 `#v1.10.0` 拼在根地址后面。同理 `…/tree/main` 这类网页地址也不行。
 >
 > 这几条不是猜的：宿主侧的解析函数 `parseInstallSpec` 曾被抽出来逐例跑过
 > （那是开发者本机的诊断脚本，**不随仓库发布** —— 见下方「关于本仓库不含开发工具」）。
 
 装完后**重启客户端**，设置页会出现 **「记忆控制」**。
 
-> **`#v1.9.1` 是版本钉子** —— 钉住版本避免"装到一半上游改了"。
+> **`#v1.10.0` 是版本钉子** —— 钉住版本避免"装到一半上游改了"。
 > 去掉 `#…` 就是跟随主分支（自动拿到新改动，也自动拿到新 bug）。
 > 全部版本见 [CHANGELOG.md](CHANGELOG.md)；升级就是**先卸载再装新版**
 > （DSH 的插件目前不支持自动更新）。
@@ -97,6 +97,9 @@ dsh plugin --profile <你的profile名> add github:eighteentang/dsh-plugin-memor
   **单个文本框上限 32 KB**（它们每一轮都进提示词，太长会长期挤占上下文）。
   > 代价：它们**随插件走** —— 插件停用/卸载，人设与准则就不生效了。
 - **下面是长期记忆列表**：搜索、按状态筛选、改状态（在用 / 已完成 / 已停用）、点「立即整理」。
+  列表上方有一条**健康度**：最近一次沉淀（含被跳过的原因）、最近一次整理、待采纳候选数、召回概况。
+  整理出来的条目默认进**候选队列**（不直接进库），在面板里点「采纳」才进正式库；也可以一键「导出」
+  成 Markdown 备份。
   列表是**一行一条、行行等高**（`层级 · 项目 · 标题 · 敏感 · 用过N次 · 状态`），
   **不展示正文** —— 标题/项目太长会省略号截断，**鼠标悬停看全文**。
   「用过几次」显示成 `3×`（悬停会说明"被自动注入过 3 次"，`–` 表示还没用过）。
@@ -107,6 +110,7 @@ dsh plugin --profile <你的profile名> add github:eighteentang/dsh-plugin-memor
   - 「记住：这个项目用两层记忆架构」→ `memory_note`
   - 「搜一下我之前说过关于注入的东西」→ `memory_search`
   - 「把那条标记成已完成」→ `memory_update`
+  - 「这条记忆刚才有用 / 已经过时了」→ `memory_feedback`（只写召回记录的反馈，不改记忆）
   - 「忘了那条吧」→ `memory_forget`（**删除需要你点头**，走审批）
 
 ### 用户级记忆（跨工作区）
@@ -178,6 +182,10 @@ $DSH_HOME/memory-lite/workspaces.json ← 库 → 工作区 的注册表
     distillMaxPerDay: 4           # 开启 autoDistill 时：每天最多整理几次（成本硬上限）
     injectMaxItems: 3             # 单次最多注入几条
     injectMaxChars: 2000          # 单次注入的字符上限
+    injectGuide: true             # 每轮注入「记忆使用说明」（空库也注入）
+    distillReview: true           # 整理结果先进候选队列，面板采纳后才进库
+    maxEntriesPerLevel: 100       # 每层 active 上限（0=不限；user/rules/soul 永不淘汰）
+    skipSubagents: true           # 子代理会话不捕获、不召回
     crossWorkspaceSearch: true    # 允许跨工作区检索
     distillProvider: ''           # 留空 = 用会话默认模型
     distillModel: ''
@@ -200,6 +208,16 @@ $DSH_HOME/memory-lite/workspaces.json ← 库 → 工作区 的注册表
 这些都是**踩过坑之后**定下来的，改动前请先读 `AGENTS.md`：
 
 - **注入只走长期层**。日志层永不进提示词，否则前缀缓存失效、上下文预算被淹。
+- **使用说明常驻，且空库也注入**。模型只有看到"什么时候该记"才会调 `memory_note`；
+  而"没指令 → 不写 → 库空 → 仍不注入"是自封闭死循环。这段是常量（不破坏前缀缓存），
+  可用 `injectGuide: false` 关掉。
+- **整理默认进候选队列**。自动/手动整理都不直接写库 —— 脏数据不进提示词，用户也不用为
+  "没打招呼就写库"担心；面板一键采纳/丢弃。
+- **写入去重三层**：内容哈希 → 前 40 字相同 → 关键词 Jaccard（同层、未归档才比较）；
+  每层有上限，淘汰顺序是"蒸馏产物优先 → 低重要性 → 最旧"，`user/rules/soul` 与用户纠正过的永不淘汰。
+- **召回判重以"可见面"为准**：不只靠进程内 Set（重启/resume 会归零），还从当前消息里
+  自己的注入块反查 id —— 重启、恢复、fork 后不会把同一批记忆再塞一遍。
+- **中文检索用 trigram**（SQLite FTS5 内置）：≥3 字的子串可被 bm25 排序；2 字查询仍走 LIKE。
 - **注入是"只追加"**：作为独立消息追加在本轮已领取消息之后，不改写已有历史。
 - **不重复注入**：同一会话里已注入过的条目不再注入；压缩后重置这个记录并**补回常驻记忆**。
 - **敏感内容 fail-closed**：`sensitive` 在**写入时**算一次并落列，注入时只读列。
@@ -219,8 +237,8 @@ $DSH_HOME/memory-lite/workspaces.json ← 库 → 工作区 的注册表
 
 ## 已知限制
 
-- **检索是关键词级的**，不是语义向量检索。中文查询按连续串与子串匹配，
-  所以**换个说法可能搜不到**（用 `memory_search` 时尽量带上你当时用的词）。
+- **检索是关键词级的**，不是语义向量检索。中文用 **trigram（≥3 字子串，带 bm25 排序）+ LIKE（2 字）**
+  —— 主要改善排序与性能，**同义/近义仍搜不到**（用 `memory_search` 时尽量带上你当时用的词）。
 - **每个工作区一个库**，默认只搜当前工作区；跨工作区要显式 `scope="all"`。
 - 日志层有容量上限（每会话约 200 条），超出会**先写归档文件再删库内行**（不静默丢）。
 - 空闲自动整理依赖宿主进程活着 —— 客户端关着的时候不会整理。
