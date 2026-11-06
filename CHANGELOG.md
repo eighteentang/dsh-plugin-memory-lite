@@ -24,6 +24,24 @@ dsh plugin --profile <你的profile名> add github:eighteentang/dsh-plugin-memor
 
 ---
 
+## [1.10.1] - 2026-11-07
+
+### 修复：蒸馏输出被截断后，日志被误标"已蒸馏"（会永久丢内容）
+
+真机复现（第一次跑 1.10.0 的蒸馏）：模型其实产出了条目，但 JSON 在 540 字处被截断
+（deepseek-flash 的**推理 token 也计入 `maxTokens`**），`parseItems` 解析出 0 条，
+而调用方继续执行 `markDistilledUpTo` → 三条日志被标记为已蒸馏，内容再也不会被整理。
+
+- `DISTILL_MAX_TOKENS` 2048 → **8192**（成本按实际输出计）。
+- 新增 `parseItemsDetailed()`：区分「合法空结果 `{"items":[]}`」与「解析失败」；
+  解析失败或 `finish=length` 一律记为 `parse-error` / `truncated`，**不标记日志**，下次重试。
+- 面板/工具会显示具体原因（失败结果里带 hint）。
+
+> 教训：把"0 条结果"当成"处理成功"会在截断时静默丢内容 —— 必须区分
+> "合法空"与"没拿到可用输出"。
+
+---
+
 ## [1.10.0] - 2026-11-07
 
 ### 新增：让记忆真的长出来
@@ -568,6 +586,7 @@ DSH 把 `runtime-context` / `time-context` / `skill-catalog` 也写成 `role:use
 [1.5.0]: https://github.com/eighteentang/dsh-plugin-memory-lite/releases/tag/v1.5.0
 [1.6.0]: https://github.com/eighteentang/dsh-plugin-memory-lite/releases/tag/v1.6.0
 [1.7.0]: https://github.com/eighteentang/dsh-plugin-memory-lite/releases/tag/v1.7.0
+[1.10.1]: https://github.com/eighteentang/dsh-plugin-memory-lite/releases/tag/v1.10.1
 [1.10.0]: https://github.com/eighteentang/dsh-plugin-memory-lite/releases/tag/v1.10.0
 [1.9.1]: https://github.com/eighteentang/dsh-plugin-memory-lite/releases/tag/v1.9.1
 [1.9.0]: https://github.com/eighteentang/dsh-plugin-memory-lite/releases/tag/v1.9.0
